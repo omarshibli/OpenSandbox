@@ -28,7 +28,12 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Sequence
 
 from fastapi import HTTPException, status
 
-from opensandbox_server.services.constants import RESERVED_LABEL_PREFIX, SandboxErrorCodes
+from opensandbox_server.services.constants import (
+    RESERVED_LABEL_PREFIX,
+    S3_RESERVED_MOUNT_OPTIONS,
+    SandboxErrorCodes,
+    s3_mount_option_error,
+)
 
 if TYPE_CHECKING:
     from opensandbox_server.api.schema import CredentialProxyConfig, NetworkPolicy, OSSFS, PlatformSpec, S3, Volume
@@ -61,14 +66,12 @@ LABEL_VALUE_RE = re.compile(r"^([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)?$")
 HOST_PATH_RE = re.compile(r"^(/|[A-Za-z]:[\\/])")
 
 # S3 bucket naming rules: 3-63 chars, lowercase letters, digits, dots, hyphens,
-# starts and ends with a letter or digit, no consecutive dots.
-_S3_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
-_S3_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d$")
-_S3_SHELL_META_RE = re.compile(r"[;&|`$()<>\n\r\s]")
+# starts and ends with a letter or digit, no consecutive dots. Anchored with
+# \\Z, not $, so a trailing newline cannot slip through.
+_S3_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]\Z")
+_S3_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d\Z")
+_S3_SHELL_META_RE = re.compile(r"[;&|`$()<>,\n\r\s]")
 _S3_PREFIX_MAX_BYTES = 1024
-S3_RESERVED_MOUNT_OPTIONS: frozenset[str] = frozenset(
-    {"prefix", "region", "read-only", "allow-delete", "allow-overwrite"}
-)
 
 
 def _normalize_prefix_path(path: str) -> str:
@@ -583,73 +586,23 @@ def ensure_valid_ossfs_volume(ossfs: "OSSFS") -> None:
         )
 
 
-def s3_mount_option_name(option: str) -> str:
-    """Return the option name of a raw Mountpoint option ('uid=1000' -> 'uid', 'prefix a/' -> 'prefix')."""
-    return re.split(r"[= ]", option.strip(), maxsplit=1)[0]
-
-
 def ensure_valid_s3_mount_option(option: str) -> None:
     """
     Validate one raw Mountpoint mount option.
 
     Rejects empty payloads, tokens starting with '-', shell metacharacters,
-    malformed shapes (only 'name', 'name=value' or 'name value' are accepted)
-    and every token that names an option the server owns
-    (see ``S3_RESERVED_MOUNT_OPTIONS``). The CSI driver splits a mount option
+    commas, malformed shapes (only 'name', 'name=value' or 'name value' are
+    accepted) and every token that names an option the server owns (see
+    ``S3_RESERVED_MOUNT_OPTIONS``). The CSI driver splits a mount option
     entry on whitespace, so a reserved name in any position is rejected.
+    Operator options go through the same checks in ``StorageConfig``.
     """
-    if not isinstance(option, str) or not option.strip():
+    reason = s3_mount_option_error(option)
+    if reason is not None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": SandboxErrorCodes.INVALID_S3_OPTION,
-                "message": "S3 options must be non-empty strings.",
-            },
+            detail={"code": SandboxErrorCodes.INVALID_S3_OPTION, "message": reason},
         )
-    normalized = option.strip()
-    tokens = [token for token in re.split(r"[\s=]+", normalized) if token]
-    if any(token.startswith("-") for token in tokens):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": SandboxErrorCodes.INVALID_S3_OPTION,
-                "message": (
-                    "S3 options must be raw option payloads without '-' prefix "
-                    "(e.g. 'uid=1000', 'allow-other')."
-                ),
-            },
-        )
-    if re.search(r"[;&|`$()<>\n\r]", normalized):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": SandboxErrorCodes.INVALID_S3_OPTION,
-                "message": f"S3 option '{normalized}' contains forbidden characters.",
-            },
-        )
-    if re.search(r"[^\S ]", normalized) or len(normalized.split(" ")) > 2:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": SandboxErrorCodes.INVALID_S3_OPTION,
-                "message": (
-                    f"S3 option '{normalized}' is malformed: "
-                    "must be 'name', 'name=value' or 'name value'."
-                ),
-            },
-        )
-    for token in tokens:
-        if token.lower() in S3_RESERVED_MOUNT_OPTIONS:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "code": SandboxErrorCodes.INVALID_S3_OPTION,
-                    "message": (
-                        f"S3 option '{token}' is reserved and set by the server. "
-                        f"Reserved options: {', '.join(sorted(S3_RESERVED_MOUNT_OPTIONS))}."
-                    ),
-                },
-            )
 
 
 def ensure_valid_s3_volume(s3: "S3", allowed_buckets: Optional[List[str]] = None) -> None:
@@ -663,7 +616,8 @@ def ensure_valid_s3_volume(s3: "S3", allowed_buckets: Optional[List[str]] = None
     Raises:
         HTTPException: When any S3 field is invalid.
     """
-    bucket = s3.bucket.strip()
+    # Validate the raw value: the PV uses it verbatim, so padding must fail here.
+    bucket = s3.bucket
     if not _S3_BUCKET_RE.match(bucket) or ".." in bucket:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -940,7 +894,6 @@ __all__ = [
     "ensure_valid_ossfs_volume",
     "ensure_valid_s3_volume",
     "ensure_valid_s3_mount_option",
-    "s3_mount_option_name",
     "S3_RESERVED_MOUNT_OPTIONS",
     "ensure_volumes_valid",
 ]

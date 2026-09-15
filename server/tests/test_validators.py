@@ -840,3 +840,20 @@ class TestS3VolumeValidation:
 
     def test_name_value_option_accepted(self):
         assert ensure_valid_s3_mount_option("cache /tmp/mp-cache") is None
+
+    @pytest.mark.parametrize("option", ["uid=1000,allow-delete", "allow-other,prefix other/", "uid=1000,gid=1000"])
+    def test_comma_separated_option_rejected(self, option):
+        with pytest.raises(HTTPException) as exc:
+            ensure_volumes_valid([self._volume(options=[option])])
+        assert exc.value.detail["code"] == SandboxErrorCodes.INVALID_S3_OPTION
+
+    def test_comma_in_prefix_rejected(self):
+        with pytest.raises(HTTPException) as exc:
+            ensure_volumes_valid([self._volume(prefix="a,b/")])
+        assert exc.value.detail["code"] == SandboxErrorCodes.INVALID_S3_PREFIX
+
+    @pytest.mark.parametrize("bucket", ["my-bucket\n", " my-bucket ", "my-bucket "])
+    def test_padded_bucket_rejected(self, bucket):
+        with pytest.raises(HTTPException) as exc:
+            ensure_volumes_valid([self._volume(bucket=bucket)])
+        assert exc.value.detail["code"] == SandboxErrorCodes.INVALID_S3_BUCKET

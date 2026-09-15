@@ -1957,6 +1957,24 @@ class TestStorageConfigS3:
         cfg = StorageConfig(s3_mount_options=["uid=1000", "gid=1000"])
         assert cfg.s3_mount_options == ["uid=1000", "gid=1000"]
 
+    def test_orphan_sweep_interval_default(self):
+        assert StorageConfig().s3_orphan_sweep_interval_seconds == 900
+
+    def test_orphan_sweep_interval_zero_disables(self):
+        assert StorageConfig(s3_orphan_sweep_interval_seconds=0).s3_orphan_sweep_interval_seconds == 0
+
+    def test_operator_mount_options_reject_shell_metacharacter(self):
+        with pytest.raises(ValueError, match="forbidden characters"):
+            StorageConfig(s3_mount_options=["uid=1000;id"])
+
+    def test_operator_mount_options_reject_comma(self):
+        with pytest.raises(ValueError, match="forbidden characters"):
+            StorageConfig(s3_mount_options=["uid=1000,gid=1000"])
+
+    def test_operator_mount_options_reject_malformed_shape(self):
+        with pytest.raises(ValueError, match="malformed"):
+            StorageConfig(s3_mount_options=["a b c"])
+
     def test_allowed_buckets_accepts_list(self):
         cfg = StorageConfig(s3_allowed_buckets=["bucket-a", "bucket-b"])
         assert cfg.s3_allowed_buckets == ["bucket-a", "bucket-b"]

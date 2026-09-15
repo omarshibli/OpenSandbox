@@ -858,20 +858,15 @@ class StorageConfig(BaseModel):
     @field_validator("s3_mount_options")
     @classmethod
     def _validate_s3_mount_options(cls, options: list[str]) -> list[str]:
-        reserved = {"prefix", "region", "read-only", "allow-delete", "allow-overwrite"}
+        # Same checks as request options so an operator entry can never be
+        # weaker than a caller entry. Imported here because the services
+        # package imports this module at import time.
+        from opensandbox_server.services.constants import s3_mount_option_error
+
         for option in options:
-            normalized = option.strip()
-            if not normalized:
-                raise ValueError("storage.s3_mount_options entries must be non-empty")
-            if normalized.startswith("-"):
-                raise ValueError(
-                    f"storage.s3_mount_options entry '{option}' must not have a '-' prefix"
-                )
-            for token in re.split(r"[\s=]+", normalized):
-                if token.lower() in reserved:
-                    raise ValueError(
-                        f"storage.s3_mount_options entry '{option}' uses reserved option '{token}'"
-                    )
+            reason = s3_mount_option_error(option)
+            if reason is not None:
+                raise ValueError(f"storage.s3_mount_options entry '{option}': {reason}")
         return options
 
 DEFAULT_EGRESS_DISABLE_IPV6 = True
