@@ -1589,7 +1589,7 @@ export interface components {
         /**
          * @description Storage mount definition for a sandbox. Each volume entry contains:
          *     - A unique name identifier
-         *     - Exactly one backend struct (host, pvc, ossfs, etc.) with backend-specific fields
+         *     - Exactly one backend struct (host, pvc, ossfs, s3) with backend-specific fields
          *     - Common mount settings (mountPath, readOnly, subPath)
          */
         Volume: {
@@ -1601,6 +1601,7 @@ export interface components {
             host?: components["schemas"]["Host"];
             pvc?: components["schemas"]["PVC"];
             ossfs?: components["schemas"]["OSSFS"];
+            s3?: components["schemas"]["S3"];
             /**
              * @description Absolute path inside the container where the volume is mounted.
              *     Must start with '/'.
@@ -1614,6 +1615,7 @@ export interface components {
             /**
              * @description Optional subdirectory under the backend path to mount.
              *     For `ossfs` backend, this field is used as the bucket prefix.
+             *     Not allowed for the `s3` backend; use `s3.prefix`.
              *     Must be a relative path without '..' components.
              */
             subPath?: string;
@@ -1714,6 +1716,35 @@ export interface components {
             accessKeyId: string;
             /** @description OSS access key secret for inline credentials mode. */
             accessKeySecret: string;
+        };
+        /**
+         * @description Amazon S3 mount backend. Kubernetes runtime only.
+         *
+         *     The server creates a static PersistentVolume for the Mountpoint for Amazon S3
+         *     CSI driver and a bound PersistentVolumeClaim, then mounts the claim into the
+         *     sandbox. Credentials come from the IAM role bound to the CSI driver
+         *     ServiceAccount (EKS Pod Identity or IRSA); the request carries none.
+         *
+         *     Mountpoint semantics: new files are written sequentially and appear on close;
+         *     overwrite (truncate) and delete are allowed for read-write mounts; append to an
+         *     existing object, random writes and rename are not supported.
+         */
+        S3: {
+            /** @description S3 bucket name (S3 bucket naming rules). */
+            bucket: string;
+            /**
+             * @description Optional key prefix inside the bucket to mount. Relative, no leading `/`,
+             *     no `..` segments. The server appends a trailing `/` if absent.
+             */
+            prefix?: string;
+            /** @description Optional AWS region of the bucket (e.g., `eu-west-1`). Detected by Mountpoint when absent. */
+            region?: string;
+            /**
+             * @description Additional Mountpoint mount options as raw payloads without leading `-`
+             *     (e.g., `uid=1000`). Server-owned options are rejected:
+             *     `prefix`, `region`, `read-only`, `allow-delete`, `allow-overwrite`.
+             */
+            options?: string[];
         };
         /** @description Build-side readiness gate for a fsb template. */
         FsbTemplateReadiness: {

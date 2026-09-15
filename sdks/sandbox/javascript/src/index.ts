@@ -69,6 +69,7 @@ export type {
   NetworkRule,
   NetworkRuleAction,
   OSSFS,
+  S3,
   PeriodicLifecycleHook,
   PlatformSpec,
   PVC,
