@@ -17,9 +17,10 @@ Volume helper utilities for Kubernetes pod specs.
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from opensandbox_server.api.schema import Volume
+from opensandbox_server.services.k8s.s3_volume import s3_object_name
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +41,14 @@ def _get_pvc_source_read_only_policies(volumes: List[Volume]) -> Dict[str, bool]
 def apply_volumes_to_pod_spec(
     pod_spec: Dict[str, Any],
     volumes: List[Volume],
+    sandbox_id: Optional[str] = None,
 ) -> None:
-    """Apply user-specified volumes to a pod spec in-place."""
+    """
+    Apply user-specified volumes to a pod spec in-place.
+
+    ``sandbox_id`` is required when any volume uses the ``s3`` backend: the
+    claim name is derived from it (see ``s3_object_name``).
+    """
     containers = pod_spec.get("containers", [])
     if not containers:
         logger.warning("No containers in pod spec, skipping volume mounts")
@@ -117,10 +124,42 @@ def apply_volumes_to_pod_spec(
             logger.info(
                 f"Added hostPath volume '{vol_name}' (path: {host_path}) mounted at '{vol.mount_path}' for sandbox"
             )
+        elif vol.s3 is not None:
+            if not sandbox_id:
+                raise ValueError(
+                    f"Volume '{vol_name}' uses the s3 backend, which requires sandbox_id "
+                    "to derive the claim name."
+                )
+
+            claim_name = s3_object_name(sandbox_id, vol_name)
+
+            pod_volumes.append({
+                "name": vol_name,
+                "persistentVolumeClaim": {
+                    "claimName": claim_name,
+                    "readOnly": vol.read_only,
+                },
+            })
+            existing_volume_names.add(vol_name)
+
+            mounts.append({
+                "name": vol_name,
+                "mountPath": vol.mount_path,
+                "readOnly": vol.read_only,
+            })
+
+            logger.info(
+                "Added s3 volume '%s' (bucket: %s, claim: %s, read_only=%s) mounted at '%s' for sandbox",
+                vol_name,
+                vol.s3.bucket,
+                claim_name,
+                vol.read_only,
+                vol.mount_path,
+            )
         else:
             raise ValueError(
                 f"Volume '{vol_name}' has no supported backend specified. "
-                "Supported backends: pvc, host"
+                "Supported backends: pvc, host, s3"
             )
 
     pod_spec["volumes"] = pod_volumes
