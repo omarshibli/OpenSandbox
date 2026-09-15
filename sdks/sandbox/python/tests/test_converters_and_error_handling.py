@@ -755,6 +755,27 @@ def test_sandbox_model_converter_to_api_volume_maps_backends() -> None:
     ossfs_dumped = SandboxModelConverter.to_api_volume(ossfs_volume).to_dict()
     assert ossfs_dumped["ossfs"]["bucket"] == "b"
 
+
+def test_sandbox_model_converter_maps_s3_volume() -> None:
+    from opensandbox.models.sandboxes import S3, Volume
+
+    volume = Volume(
+        name="logs",
+        s3=S3(bucket="b", prefix="p/", region="eu-west-1", options=["uid=1000"]),
+        mount_path="/mnt/logs",
+        read_only=True,
+    )
+    dumped = SandboxModelConverter.to_api_volume(volume).to_dict()
+    assert dumped["s3"] == {
+        "bucket": "b",
+        "prefix": "p/",
+        "region": "eu-west-1",
+        "options": ["uid=1000"],
+    }
+    assert dumped["readOnly"] is True
+    assert "ossfs" not in dumped and "pvc" not in dumped and "host" not in dumped
+
+
 def test_sandbox_model_converter_maps_platform_from_create_response() -> None:
     from opensandbox.api.lifecycle.models.create_sandbox_response import (
         CreateSandboxResponse,

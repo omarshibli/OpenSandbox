@@ -124,6 +124,9 @@ class SandboxModelConverter:
         from opensandbox.api.lifecycle.models.pvc import (
             PVC as ApiPVC,
         )
+        from opensandbox.api.lifecycle.models.s3 import (
+            S3 as ApiS3,
+        )
         from opensandbox.api.lifecycle.models.volume import Volume as ApiVolume
         from opensandbox.api.lifecycle.types import UNSET
 
@@ -158,6 +161,15 @@ class SandboxModelConverter:
                 options=volume.ossfs.options if volume.ossfs.options is not None else UNSET,
             )
 
+        api_s3 = UNSET
+        if volume.s3 is not None and not isinstance(volume.s3, Unset):
+            api_s3 = ApiS3(
+                bucket=volume.s3.bucket,
+                prefix=volume.s3.prefix if volume.s3.prefix is not None else UNSET,
+                region=volume.s3.region if volume.s3.region is not None else UNSET,
+                options=volume.s3.options if volume.s3.options is not None else UNSET,
+            )
+
         api_sub_path = UNSET
         if volume.sub_path is not None and not isinstance(volume.sub_path, Unset):
             api_sub_path = volume.sub_path
@@ -169,6 +181,7 @@ class SandboxModelConverter:
             host=api_host,
             pvc=api_pvc,
             ossfs=api_ossfs,
+            s3=api_s3,
             sub_path=api_sub_path,
         )
 

@@ -54,6 +54,7 @@ from opensandbox.models.isolated import (
 )
 from opensandbox.models.sandboxes import (
     PVC,
+    S3,
     Credential,
     CredentialAuth,
     CredentialBinding,
@@ -162,4 +163,5 @@ __all__ = [
     "Volume",
     "Host",
     "PVC",
+    "S3",
 ]

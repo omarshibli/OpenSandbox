@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from ..models.host import Host
     from ..models.ossfs import OSSFS
     from ..models.pvc import PVC
+    from ..models.s3 import S3
 
 
 T = TypeVar("T", bound="Volume")
@@ -36,7 +37,7 @@ T = TypeVar("T", bound="Volume")
 class Volume:
     """Storage mount definition for a sandbox. Each volume entry contains:
     - A unique name identifier
-    - Exactly one backend struct (host, pvc, ossfs, etc.) with backend-specific fields
+    - Exactly one backend struct (host, pvc, ossfs, s3) with backend-specific fields
     - Common mount settings (mountPath, readOnly, subPath)
 
         Attributes:
@@ -62,10 +63,21 @@ class Volume:
                 and bind-mounts the resolved path into the sandbox container.
                 Prefix selection is expressed via `Volume.subPath`.
                 In Docker runtime, OSSFS backend requires OpenSandbox Server to run on a Linux host with FUSE support.
+            s3 (S3 | Unset): Amazon S3 mount backend. Kubernetes runtime only.
+
+                The server creates a static PersistentVolume for the Mountpoint for Amazon S3
+                CSI driver and a bound PersistentVolumeClaim, then mounts the claim into the
+                sandbox. Credentials come from the IAM role bound to the CSI driver
+                ServiceAccount (EKS Pod Identity or IRSA); the request carries none.
+
+                Mountpoint semantics: new files are written sequentially and appear on close;
+                overwrite (truncate) and delete are allowed for read-write mounts; append to an
+                existing object, random writes and rename are not supported.
             read_only (bool | Unset): If true, the volume is mounted as read-only. Defaults to false (read-write).
                  Default: False.
             sub_path (str | Unset): Optional subdirectory under the backend path to mount.
                 For `ossfs` backend, this field is used as the bucket prefix.
+                Not allowed for the `s3` backend; use `s3.prefix`.
                 Must be a relative path without '..' components.
     """
 
@@ -74,6 +86,7 @@ class Volume:
     host: Host | Unset = UNSET
     pvc: PVC | Unset = UNSET
     ossfs: OSSFS | Unset = UNSET
+    s3: S3 | Unset = UNSET
     read_only: bool | Unset = False
     sub_path: str | Unset = UNSET
 
@@ -94,6 +107,10 @@ class Volume:
         if not isinstance(self.ossfs, Unset):
             ossfs = self.ossfs.to_dict()
 
+        s3: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.s3, Unset):
+            s3 = self.s3.to_dict()
+
         read_only = self.read_only
 
         sub_path = self.sub_path
@@ -112,6 +129,8 @@ class Volume:
             field_dict["pvc"] = pvc
         if ossfs is not UNSET:
             field_dict["ossfs"] = ossfs
+        if s3 is not UNSET:
+            field_dict["s3"] = s3
         if read_only is not UNSET:
             field_dict["readOnly"] = read_only
         if sub_path is not UNSET:
@@ -124,6 +143,7 @@ class Volume:
         from ..models.host import Host
         from ..models.ossfs import OSSFS
         from ..models.pvc import PVC
+        from ..models.s3 import S3
 
         d = dict(src_dict)
         name = d.pop("name")
@@ -151,6 +171,13 @@ class Volume:
         else:
             ossfs = OSSFS.from_dict(_ossfs)
 
+        _s3 = d.pop("s3", UNSET)
+        s3: S3 | Unset
+        if isinstance(_s3, Unset):
+            s3 = UNSET
+        else:
+            s3 = S3.from_dict(_s3)
+
         read_only = d.pop("readOnly", UNSET)
 
         sub_path = d.pop("subPath", UNSET)
@@ -161,6 +188,7 @@ class Volume:
             host=host,
             pvc=pvc,
             ossfs=ossfs,
+            s3=s3,
             read_only=read_only,
             sub_path=sub_path,
         )
