@@ -23,7 +23,14 @@ from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 from kubernetes import client, config
-from kubernetes.client import ApiException, CoreV1Api, CustomObjectsApi, NodeV1Api, V1APIResourceList
+from kubernetes.client import (
+    ApiException,
+    CoreV1Api,
+    CustomObjectsApi,
+    NodeV1Api,
+    StorageV1Api,
+    V1APIResourceList,
+)
 
 from opensandbox_server.config import KubernetesRuntimeConfig
 from opensandbox_server.services.k8s.informer import WorkloadInformer
@@ -53,6 +60,7 @@ class K8sClient:
         self.config = k8s_config
         self._load_config()
         self._core_v1_api: Optional[CoreV1Api] = None
+        self._storage_v1_api: Optional[StorageV1Api] = None
         self._custom_objects_api: Optional[CustomObjectsApi] = None
         self._node_v1_api: Optional[NodeV1Api] = None
         self._informers: Dict[_InformerKey, WorkloadInformer] = {}
@@ -82,6 +90,11 @@ class K8sClient:
         if self._core_v1_api is None:
             self._core_v1_api = client.CoreV1Api()
         return self._core_v1_api
+
+    def get_storage_v1_api(self) -> StorageV1Api:
+        if self._storage_v1_api is None:
+            self._storage_v1_api = client.StorageV1Api()
+        return self._storage_v1_api
 
     def get_custom_objects_api(self) -> CustomObjectsApi:
         if self._custom_objects_api is None:
@@ -451,6 +464,56 @@ class K8sClient:
             _return_http_data_only=True,
             collection_formats={},
         )
+
+    # ------------------------------------------------------------------
+    # PersistentVolume and CSIDriver operations (cluster-scoped)
+    # ------------------------------------------------------------------
+
+    def create_pv(self, body: Any) -> Any:
+        """Create a PersistentVolume."""
+        if self._write_limiter:
+            self._write_limiter.acquire()
+        return self.get_core_v1_api().create_persistent_volume(body=body)
+
+    def get_pv(self, name: str) -> Optional[Any]:
+        """Read a PersistentVolume by name. Returns None on 404."""
+        if self._read_limiter:
+            self._read_limiter.acquire()
+        try:
+            return self.get_core_v1_api().read_persistent_volume(name=name)
+        except ApiException as e:
+            if e.status == 404:
+                return None
+            raise
+
+    def list_pvs(self, label_selector: str = "") -> List[Any]:
+        """List PersistentVolumes, returning the items list."""
+        if self._read_limiter:
+            self._read_limiter.acquire()
+        result = self.get_core_v1_api().list_persistent_volume(label_selector=label_selector)
+        return list(getattr(result, "items", []) or [])
+
+    def delete_pv(self, name: str) -> None:
+        """Delete a PersistentVolume by name. 404 is swallowed."""
+        if self._write_limiter:
+            self._write_limiter.acquire()
+        try:
+            self.get_core_v1_api().delete_persistent_volume(name=name)
+        except ApiException as e:
+            if e.status == 404:
+                return
+            raise
+
+    def get_csi_driver(self, name: str) -> Optional[Any]:
+        """Read a storage.k8s.io/v1 CSIDriver by name. Returns None on 404."""
+        if self._read_limiter:
+            self._read_limiter.acquire()
+        try:
+            return self.get_storage_v1_api().read_csi_driver(name=name)
+        except ApiException as e:
+            if e.status == 404:
+                return None
+            raise
 
     # ------------------------------------------------------------------
     # Secret operations
