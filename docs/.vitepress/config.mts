@@ -243,6 +243,10 @@ export default defineConfig({
               text: "Kubernetes PVC",
               link: "/examples/kubernetes-pvc-volume-mount",
             },
+            {
+              text: "Kubernetes S3",
+              link: "/examples/kubernetes-s3-volume-mount",
+            },
           ],
         },
       ],
