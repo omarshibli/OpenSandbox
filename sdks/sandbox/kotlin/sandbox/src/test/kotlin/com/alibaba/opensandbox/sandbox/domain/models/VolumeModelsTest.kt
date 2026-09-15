@@ -19,6 +19,7 @@ package com.alibaba.opensandbox.sandbox.domain.models
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Host
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.OSSFS
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PVC
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.S3
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.Volume
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
@@ -242,5 +243,55 @@ class VolumeModelsTest {
                 .build()
 
         assertFalse(volume.readOnly)
+    }
+
+    @Test
+    fun `S3 should require bucket and keep optional fields null`() {
+        val backend = S3.builder().bucket("my-team-sandbox-logs").build()
+        assertEquals("my-team-sandbox-logs", backend.bucket)
+        assertNull(backend.prefix)
+        assertNull(backend.region)
+        assertNull(backend.options)
+    }
+
+    @Test
+    fun `S3 builder should reject blank bucket`() {
+        assertThrows(IllegalArgumentException::class.java) { S3.builder().bucket("  ").build() }
+    }
+
+    @Test
+    fun `Volume with S3 backend should be created correctly`() {
+        val volume =
+            Volume.builder()
+                .name("logs")
+                .s3(
+                    S3.builder()
+                        .bucket("my-team-sandbox-logs")
+                        .prefix("sandboxes/task-001/")
+                        .region("eu-west-1")
+                        .options("uid=1000", "gid=1000")
+                        .build(),
+                )
+                .mountPath("/mnt/logs")
+                .readOnly(true)
+                .build()
+
+        assertNotNull(volume.s3)
+        assertEquals("sandboxes/task-001/", volume.s3?.prefix)
+        assertEquals(listOf("uid=1000", "gid=1000"), volume.s3?.options)
+        assertNull(volume.ossfs)
+        assertTrue(volume.readOnly)
+    }
+
+    @Test
+    fun `Volume should reject S3 together with PVC`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            Volume.builder()
+                .name("x")
+                .s3(S3.builder().bucket("b").build())
+                .pvc(PVC.of("c"))
+                .mountPath("/x")
+                .build()
+        }
     }
 }

@@ -38,6 +38,7 @@ import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PagedSandboxInfos
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PagedSnapshotInfos
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PaginationInfo
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.PlatformSpec
+import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.S3
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxAllocation
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxCreateResponse
 import com.alibaba.opensandbox.sandbox.domain.models.sandboxes.SandboxEndpoint
@@ -62,6 +63,7 @@ import com.alibaba.opensandbox.sandbox.api.models.PVC as ApiPVC
 import com.alibaba.opensandbox.sandbox.api.models.PaginationInfo as ApiPaginationInfo
 import com.alibaba.opensandbox.sandbox.api.models.PeriodicLifecycleHook as ApiPeriodicLifecycleHook
 import com.alibaba.opensandbox.sandbox.api.models.PlatformSpec as ApiPlatformSpec
+import com.alibaba.opensandbox.sandbox.api.models.S3 as ApiS3
 import com.alibaba.opensandbox.sandbox.api.models.Sandbox as ApiSandbox
 import com.alibaba.opensandbox.sandbox.api.models.SandboxLifecycle as ApiSandboxLifecycle
 import com.alibaba.opensandbox.sandbox.api.models.SandboxStatus as ApiSandboxStatus
@@ -239,6 +241,18 @@ internal object SandboxModelConverter {
     }
 
     /**
+     * Converts Domain S3 -> API S3
+     */
+    fun S3.toApiS3(): ApiS3 {
+        return ApiS3(
+            bucket = this.bucket,
+            prefix = this.prefix,
+            region = this.region,
+            options = this.options,
+        )
+    }
+
+    /**
      * Converts Domain Volume -> API Volume
      */
     fun Volume.toApiVolume(): ApiVolume {
@@ -249,6 +263,7 @@ internal object SandboxModelConverter {
             host = this.host?.toApiHost(),
             pvc = this.pvc?.toApiPVC(),
             ossfs = this.ossfs?.toApiOSSFS(),
+            s3 = this.s3?.toApiS3(),
             subPath = this.subPath,
         )
     }
