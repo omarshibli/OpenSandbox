@@ -244,9 +244,9 @@ Validation, HTTP 400, before any side effect:
 
 Provisioning, from the Kubernetes API:
 
-- **Create fails.** Roll back objects created in this request, return `K8S_API_ERROR` with the API message. A 403 names the missing RBAC verb, like the PVC code today.
+- **Create fails.** Roll back objects created in this request, return `KUBERNETES::API_ERROR` with the API message. A 403 names the missing RBAC verb, like the PVC code today.
 - **409 on create.** The name embeds the sandbox id, so a conflict is a leftover from an earlier attempt for the same id. Read the existing object; if its `opensandbox.io/id` label matches, reuse it; otherwise return 500 with a clear message.
-- **Mount fails on the node** (wrong bucket, IAM denied). The kubelet emits a `FailedMount` event and the pod never becomes ready. The readiness loop in `_wait_for_sandbox_ready` reads only the workload status message today. On a readiness timeout for a sandbox that has an `s3` volume, the server reads pod events through the existing `get_sandbox_events` diagnostics helper and appends the last `FailedMount` message to the `K8S_POD_READY_TIMEOUT` detail. The existing cleanup path then removes the PV and PVC.
+- **Mount fails on the node** (wrong bucket, IAM denied). The kubelet emits a `FailedMount` event and the pod never becomes ready. The readiness loop in `_wait_for_sandbox_ready` reads only the workload status message today. On a readiness timeout for a sandbox that has an `s3` volume, the server reads pod events through the existing `get_sandbox_events` diagnostics helper and appends the last `FailedMount` message to the `KUBERNETES::POD_READY_TIMEOUT` detail. The existing cleanup path then removes the PV and PVC.
 
 Cleanup is best effort and logged; 404 is success, and the startup sweep catches leftovers.
 
