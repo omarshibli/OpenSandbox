@@ -168,6 +168,13 @@ configToml: |
   informer_watch_timeout_seconds = 60
   workload_provider = "batchsandbox"
   batchsandbox_template_file = "/etc/opensandbox/example.batchsandbox-template.yaml"
+
+  # [storage]
+  # s3 volume backend (Kubernetes runtime). Requires the Mountpoint for
+  # Amazon S3 CSI driver and an IAM role bound to its ServiceAccount.
+  # s3_csi_driver = "s3.csi.aws.com"
+  # s3_mount_options = ["uid=1000", "gid=1000"]
+  # s3_allowed_buckets = []
   
   [egress]
   image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:v1.1.7"
