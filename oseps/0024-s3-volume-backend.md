@@ -114,7 +114,7 @@ The recommended log pattern is therefore **one object per command**, for example
 
 - **A single IAM role is shared by all sandboxes in the cluster.** Mitigation: the role's resource ARNs are the real boundary, and the optional `s3_allowed_buckets` allowlist adds a server-side check. Per-tenant roles remain possible later through `authenticationSource: pod` with no API change.
 - **Users expect POSIX behavior and see silent surprises** (no append, no rename). Mitigation: the semantics table above ships in `docs/examples/kubernetes-s3-volume-mount.md` with the one-object-per-command pattern.
-- **Leaked cluster-scoped PVs.** PVs cannot carry a namespaced `ownerReference`, so garbage collection does not reclaim them. Mitigation: labeled objects, deletion on the sandbox delete/expiry/create-failure paths, and a startup sweep that removes PVs whose `claimRef` PVC is gone.
+- **Leaked cluster-scoped PVs.** PVs cannot carry a namespaced `ownerReference`, so garbage collection does not reclaim them. Mitigation: labeled objects, deletion on the sandbox delete and create-failure paths, and a gated orphan sweep (at startup and on a timer) that removes PVs whose `claimRef` PVC is gone, which is also what reclaims the PV after a controller-driven TTL expiry.
 - **Mount failures surface only as a pod that never becomes ready.** Mitigation: on a readiness timeout for a sandbox with an `s3` volume, the server appends the last `FailedMount` event to the error detail.
 - **Cluster prerequisites missing.** Mitigation: the server checks for the `CSIDriver` object and fails with `VOLUME::UNSUPPORTED_BACKEND` and a message naming the add-on to install.
 - **Option injection through `options`.** Mitigation: the same validation as `ossfs.options` plus the reserved-name list, applied to both request and operator options (operator options are validated at startup).
@@ -207,7 +207,9 @@ Rules:
 ### Cleanup
 
 - `_cleanup_managed_pvcs(sandbox_id)` also deletes PVs labeled `opensandbox.io/volume-managed-by=server` and `opensandbox.io/id=<sandbox-id>`. It runs on delete, on expiry, and on create failure, as today. Deletion is best effort and logged; 404 is success.
-- **Startup sweep.** On start, the server lists PVs with `opensandbox.io/volume-managed-by=server`. For each PV whose `claimRef` PVC no longer exists, it deletes the PV. This covers PVCs removed by controller garbage collection while the server was down.
+- **Orphan sweep.** Controller-driven expiry never calls `delete_sandbox`: the PVC goes with `ownerReferences` garbage collection and the PV is left `Released`. The server therefore lists PVs with `opensandbox.io/volume-managed-by=server` at startup and again every `storage.s3_orphan_sweep_interval_seconds` (default 900; 0 disables the periodic run), and deletes each PV whose `claimRef` PVC no longer exists.
+- **Sweep safety.** `build_s3_pv_body` pre-sets `claimRef`, so between `create_pv` and `create_pvc` a healthy PV is indistinguishable from an orphan, and a restarting replica must not delete another replica's in-flight PV. A `Bound` PV is never deleted. Any other phase is deleted only once the PVC is confirmed missing AND the PV is already `Released`/`Failed` or older than 10 minutes; a missing or unreadable `creationTimestamp` counts as too young.
+- **Scope.** `S3VolumeProvisioner.cleanup` returns without listing PVs when this process never provisioned or verified an s3 object, so a deployment that does not use s3 volumes pays no cluster-wide LIST (and needs no PV RBAC) on every sandbox delete. Sandboxes provisioned before a restart still converge: the label sweep removes the PVC and the orphan sweep removes the Released PV.
 
 ### RBAC
 
@@ -248,7 +250,7 @@ Provisioning, from the Kubernetes API:
 - **409 on create.** The name embeds the sandbox id, so a conflict is a leftover from an earlier attempt for the same id. Read the existing object; if its `opensandbox.io/id` label matches, reuse it; otherwise return 500 with a clear message.
 - **Mount fails on the node** (wrong bucket, IAM denied). The kubelet emits a `FailedMount` event and the pod never becomes ready. The readiness loop in `_wait_for_sandbox_ready` reads only the workload status message today. On a readiness timeout for a sandbox that has an `s3` volume, the server reads pod events through the existing `get_sandbox_events` diagnostics helper and appends the last `FailedMount` message to the `KUBERNETES::POD_READY_TIMEOUT` detail. The existing cleanup path then removes the PV and PVC.
 
-Cleanup is best effort and logged; 404 is success, and the startup sweep catches leftovers.
+Cleanup is best effort and logged; 404 is success, and the orphan sweep (startup and periodic) catches leftovers.
 
 ## Test Plan
 
@@ -257,7 +259,7 @@ Unit tests in `server/tests/`, following the `ossfs` and PVC test shapes:
 - **Schema** (`test_schema.py`): valid `s3` volume, serialization round trip, `s3` plus another backend rejected, unknown field rejected.
 - **Validators** (`test_validators.py`): one test per error code, allowlist, reserved options, `subPath` rejection, prefix normalization.
 - **Pod spec** (`test_batchsandbox_provider.py`): PVC source and mount for `s3`, with and without `readOnly`, no `subPath`; multiple `s3` volumes; internal name conflict.
-- **Provisioning** (new `test_s3_volume.py`): PV and PVC bodies match this design exactly, including option order and read-only handling; rollback on partial failure; 409 reuse and mismatch; missing `CSIDriver`; cleanup deletes PV and PVC; startup sweep deletes an orphan PV and keeps a bound one; timeout detail includes the `FailedMount` message.
+- **Provisioning** (new `test_s3_volume.py`): PV and PVC bodies match this design exactly, including option order and read-only handling; rollback on partial failure; 409 reuse and mismatch; missing `CSIDriver`; cleanup deletes PV and PVC; the sweep deletes an aged or Released orphan PV and keeps a bound or freshly created one; timeout detail includes the `FailedMount` message.
 - **Runtime gate** (`test_docker_service.py`): `s3` returns `UNSUPPORTED_BACKEND`.
 - **SDKs**: model tests per SDK, like the `OSSFS` tests.
 
@@ -270,7 +272,7 @@ The Kind e2e suite **cannot** cover this backend: it has no AWS credentials, and
 
 ## Drawbacks
 
-- The server now creates cluster-scoped objects (PVs), which needs wider RBAC and its own cleanup path, including a startup sweep, because Kubernetes garbage collection cannot own them.
+- The server now creates cluster-scoped objects (PVs), which needs wider RBAC and its own cleanup path, including a periodic orphan sweep, because Kubernetes garbage collection cannot own them.
 - The feature is cloud-specific. It works on EKS with an AWS add-on, so the Kubernetes runtime gains a backend that not every Kubernetes deployment can use, and an operator prerequisite that the server can only detect, not install.
 - Mountpoint semantics are weaker than POSIX. Applications that append or edit in place break inside the mount, which the API cannot express.
 - Sandboxes share one IAM role until per-tenant identity lands, so the blast radius of a bucket grant is the whole cluster.

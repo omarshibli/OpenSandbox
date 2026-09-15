@@ -293,6 +293,7 @@ Host-side storage related to **volume mounts** (host bind allowlist, OSSFS mount
 | `s3_csi_driver` | string | `"s3.csi.aws.com"` | Name of the `CSIDriver` object used for **s3** volumes (Mountpoint for Amazon S3 CSI driver). Checked before the server creates s3 volumes. |
 | `s3_mount_options` | list of strings | `[]` | Operator Mountpoint options added to every s3 volume (e.g. `uid=1000`). Raw payloads without leading `-`; server-owned options are rejected. |
 | `s3_allowed_buckets` | list of strings | `[]` | Allowlist of S3 buckets for s3 volumes. Empty means any bucket; the IAM role is the boundary. |
+| `s3_orphan_sweep_interval_seconds` | integer | `900` | Period (seconds) of the background sweep that deletes server-managed s3 PersistentVolumes whose PersistentVolumeClaim is gone — for example after a TTL expiry removed the claim through `ownerReferences`. `0` disables the periodic sweep; the startup sweep always runs. |
 
 Sandbox **volume** models (`host`, `pvc`, `ossfs`, `s3`) in API requests are documented in the OpenAPI specs and OSEPs; this table only covers **server** storage settings.
 

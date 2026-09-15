@@ -7,7 +7,7 @@ description: Mount an Amazon S3 bucket prefix into OpenSandbox containers on EKS
 
 This example mounts an S3 bucket prefix at a path inside a sandbox that runs on Amazon EKS. The server uses the [Mountpoint for Amazon S3 CSI driver](https://github.com/awslabs/mountpoint-s3-csi-driver). Credentials come from an IAM role bound to the driver ServiceAccount. The API request carries no keys.
 
-The `s3` backend is available on the Kubernetes runtime only. The Docker runtime rejects it with `VOLUME::UNSUPPORTED_BACKEND`.
+The `s3` backend is available on the Kubernetes runtime only. The Docker and FastSandbox runtimes reject it with `VOLUME::UNSUPPORTED_BACKEND`.
 
 ## Prerequisites
 
@@ -58,6 +58,7 @@ The stock Helm chart grants the RBAC the server needs (`persistentvolumes` and `
 s3_csi_driver = "s3.csi.aws.com"        # CSIDriver object name
 s3_mount_options = ["uid=1000", "gid=1000"]  # added to every s3 mount
 s3_allowed_buckets = ["my-team-sandbox-logs"]  # empty = any bucket
+s3_orphan_sweep_interval_seconds = 900       # orphan PV sweep period; 0 disables it
 ```
 
 ## Create a sandbox with an S3 volume
@@ -84,7 +85,7 @@ The object `sandboxes/task-001/step-1.stdout` appears in the bucket when the fil
 
 ## What the server creates
 
-For each `s3` volume the server creates a `PersistentVolume` named `s3-<sandbox-id>-<volume-name>` (CSI driver `s3.csi.aws.com`, `bucketName`, mount options) and a `PersistentVolumeClaim` of the same name, then mounts the claim. Both objects carry `opensandbox.io/volume-managed-by=server` and `opensandbox.io/id=<sandbox-id>`. The server removes them when the sandbox is deleted or expires, and sweeps orphaned PVs at startup.
+For each `s3` volume the server creates a `PersistentVolume` named `s3-<sandbox-id>-<volume-name>` (CSI driver `s3.csi.aws.com`, `bucketName`, mount options) and a `PersistentVolumeClaim` of the same name, then mounts the claim. Both objects carry `opensandbox.io/volume-managed-by=server` and `opensandbox.io/id=<sandbox-id>`. The server removes both objects when the sandbox is deleted. When a sandbox expires, Kubernetes garbage-collects the PVC through its `ownerReferences` and the `Released` PV is removed by the orphan sweep, which runs at startup and then every `s3_orphan_sweep_interval_seconds` (default 15 minutes). The sweep never touches a `Bound` PV, and it leaves a PV younger than 10 minutes alone unless it is already `Released` or `Failed`, so a volume that is still being bound is safe.
 
 Mount options in order: `allow-other`; `allow-delete` and `allow-overwrite` (read-write) or `read-only`; `prefix <prefix>`; `region <region>`; operator `s3_mount_options`; request `options`. A request cannot set `prefix`, `region`, `read-only`, `allow-delete` or `allow-overwrite` in `options`.
 

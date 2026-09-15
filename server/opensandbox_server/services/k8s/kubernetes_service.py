@@ -1275,6 +1275,10 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         never touched. Errors are logged but never propagate — workload
         deletion has already succeeded and PVC cleanup is best-effort.
 
+        Also deletes the cluster-scoped PersistentVolumes of ``s3`` volumes
+        through ``S3VolumeProvisioner.cleanup``, because a PV cannot carry a
+        namespaced ``ownerReference`` and so is never garbage-collected.
+
         Runs after workload deletion so the kubelet has dropped the
         ``kubernetes.io/pvc-protection`` finalizer; otherwise the PVC would
         stay in the ``Terminating`` state until pod teardown completes
