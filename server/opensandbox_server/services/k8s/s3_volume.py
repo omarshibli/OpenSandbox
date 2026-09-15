@@ -25,11 +25,18 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import List, Optional
+from typing import Any, List, Optional
+
+from fastapi import HTTPException, status
+from kubernetes.client import ApiException
 
 from opensandbox_server.api.schema import Volume
 from opensandbox_server.config import StorageConfig
-from opensandbox_server.services.constants import SANDBOX_ID_LABEL, SANDBOX_MANAGED_VOLUMES_LABEL
+from opensandbox_server.services.constants import (
+    SANDBOX_ID_LABEL,
+    SANDBOX_MANAGED_VOLUMES_LABEL,
+    SandboxErrorCodes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,3 +144,217 @@ def extract_failed_mount_message(events_text: str) -> Optional[str]:
         if match and match.group(2) == "FailedMount":
             last = match.group(3).strip()
     return last
+
+
+def has_s3_volumes(volumes: Optional[List[Volume]]) -> bool:
+    return any(v.s3 is not None for v in (volumes or []))
+
+
+class S3VolumeProvisioner:
+    """
+    Creates, reuses and removes the PV/PVC pair behind each ``s3`` volume.
+
+    PVCs carry the same managed labels as server-created PVCs, so the
+    existing label sweep and ``ownerReferences`` GC remove them. PVs are
+    cluster-scoped and cannot be owned by a namespaced CR, so ``cleanup``
+    deletes them explicitly and ``sweep_orphans`` catches leftovers at
+    startup.
+    """
+
+    def __init__(self, k8s_client: Any, storage: StorageConfig):
+        self.k8s_client = k8s_client
+        self.storage = storage
+        self._driver_verified = False
+
+    # -- driver -----------------------------------------------------------
+
+    def ensure_driver_installed(self) -> None:
+        """Fail with a clear error when the CSI driver is not installed. Positive result is cached."""
+        if self._driver_verified:
+            return
+        driver_name = self.storage.s3_csi_driver
+        try:
+            driver = self.k8s_client.get_csi_driver(driver_name)
+        except ApiException as e:
+            if e.status == 403:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail={
+                        "code": SandboxErrorCodes.K8S_API_ERROR,
+                        "message": (
+                            f"Cannot verify CSI driver '{driver_name}': server lacks 'get' on "
+                            "storage.k8s.io/csidrivers. Operator must grant the missing RBAC."
+                        ),
+                    },
+                ) from e
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.K8S_API_ERROR,
+                    "message": f"Failed to read CSI driver '{driver_name}': {e.reason or e}",
+                },
+            ) from e
+        if driver is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.UNSUPPORTED_VOLUME_BACKEND,
+                    "message": (
+                        f"The s3 volume backend requires the CSI driver '{driver_name}', which is not "
+                        "installed in this cluster. Install the Mountpoint for Amazon S3 CSI driver "
+                        "(EKS add-on 'aws-mountpoint-s3-csi-driver')."
+                    ),
+                },
+            )
+        self._driver_verified = True
+
+    # -- provisioning -----------------------------------------------------
+
+    def ensure(self, volumes: List[Volume], sandbox_id: str, namespace: str) -> List[str]:
+        """
+        Create the PV and PVC for every ``s3`` volume. Returns their claim
+        names. On any failure, objects created by this call are deleted and
+        the error is re-raised as an HTTPException.
+        """
+        created_pvs: List[str] = []
+        created_pvcs: List[str] = []
+        claims: List[str] = []
+        try:
+            for volume in volumes:
+                if volume.s3 is None:
+                    continue
+                name = s3_object_name(sandbox_id, volume.name)
+                if self._create_or_reuse_pv(build_s3_pv_body(volume, sandbox_id, namespace, self.storage), sandbox_id):
+                    created_pvs.append(name)
+                if self._create_or_reuse_pvc(
+                    build_s3_pvc_body(volume, sandbox_id, namespace, self.storage), sandbox_id, namespace
+                ):
+                    created_pvcs.append(name)
+                claims.append(name)
+        except Exception:
+            self._rollback(created_pvcs, created_pvs, namespace, sandbox_id)
+            raise
+        return claims
+
+    def _create_or_reuse_pv(self, body: dict, sandbox_id: str) -> bool:
+        """Returns True when the PV was created by this call, False when a same-sandbox leftover was reused."""
+        name = body["metadata"]["name"]
+        try:
+            self.k8s_client.create_pv(body)
+            logger.info(f"sandbox={sandbox_id} | created s3 PV '{name}'")
+            return True
+        except ApiException as e:
+            if e.status == 409:
+                existing = self.k8s_client.get_pv(name)
+                self._assert_owned_by(existing, name, sandbox_id, kind="PersistentVolume")
+                logger.info(f"sandbox={sandbox_id} | reusing existing s3 PV '{name}'")
+                return False
+            raise self._api_error("create", "persistentvolumes", name, e) from e
+
+    def _create_or_reuse_pvc(self, body: dict, sandbox_id: str, namespace: str) -> bool:
+        name = body["metadata"]["name"]
+        try:
+            self.k8s_client.create_pvc(namespace, body)
+            logger.info(f"sandbox={sandbox_id} | created s3 PVC '{name}' in '{namespace}'")
+            return True
+        except ApiException as e:
+            if e.status == 409:
+                existing = self.k8s_client.get_pvc(namespace, name)
+                self._assert_owned_by(existing, name, sandbox_id, kind="PersistentVolumeClaim")
+                logger.info(f"sandbox={sandbox_id} | reusing existing s3 PVC '{name}'")
+                return False
+            raise self._api_error("create", "persistentvolumeclaims", name, e) from e
+
+    @staticmethod
+    def _assert_owned_by(obj: Any, name: str, sandbox_id: str, *, kind: str) -> None:
+        labels = getattr(getattr(obj, "metadata", None), "labels", None) or {}
+        if (
+            obj is None
+            or labels.get(SANDBOX_ID_LABEL) != sandbox_id
+            or labels.get(SANDBOX_MANAGED_VOLUMES_LABEL) != "server"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.K8S_API_ERROR,
+                    "message": (
+                        f"{kind} '{name}' already exists and is not managed by this sandbox "
+                        f"('{sandbox_id}'). Refusing to reuse it."
+                    ),
+                },
+            )
+
+    @staticmethod
+    def _api_error(verb: str, resource: str, name: str, e: ApiException) -> HTTPException:
+        if e.status == 403:
+            message = (
+                f"Cannot {verb} {resource} '{name}': server lacks '{verb}' on {resource}. "
+                "Operator must grant the missing RBAC."
+            )
+        else:
+            message = f"Failed to {verb} {resource} '{name}': {e.reason or e}"
+        return HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": SandboxErrorCodes.K8S_API_ERROR, "message": message},
+        )
+
+    def _rollback(self, pvcs: List[str], pvs: List[str], namespace: str, sandbox_id: str) -> None:
+        for name in pvcs:
+            try:
+                self.k8s_client.delete_pvc(namespace, name)
+            except Exception as ex:
+                logger.warning(f"sandbox={sandbox_id} | rollback: failed to delete s3 PVC '{name}': {ex}")
+        for name in pvs:
+            try:
+                self.k8s_client.delete_pv(name)
+            except Exception as ex:
+                logger.warning(f"sandbox={sandbox_id} | rollback: failed to delete s3 PV '{name}': {ex}")
+
+    # -- cleanup ----------------------------------------------------------
+
+    def cleanup(self, sandbox_id: str) -> None:
+        """Delete the PVs labeled for this sandbox. Best effort; never raises."""
+        selector = f"{SANDBOX_MANAGED_VOLUMES_LABEL}=server,{SANDBOX_ID_LABEL}={sandbox_id}"
+        try:
+            pvs = self.k8s_client.list_pvs(label_selector=selector)
+        except Exception as e:
+            logger.warning(f"sandbox={sandbox_id} | failed to list s3 PVs: {e}")
+            return
+        for pv in pvs:
+            name = getattr(getattr(pv, "metadata", None), "name", None)
+            if not name:
+                continue
+            try:
+                self.k8s_client.delete_pv(name)
+                logger.info(f"sandbox={sandbox_id} | deleted s3 PV '{name}'")
+            except Exception as e:
+                logger.warning(f"sandbox={sandbox_id} | failed to delete s3 PV '{name}': {e}")
+
+    def sweep_orphans(self) -> int:
+        """
+        Delete server-managed PVs whose bound PVC no longer exists (for
+        example, removed by ownerReference GC while the server was down).
+        Returns the number of PVs deleted. Best effort; never raises.
+        """
+        try:
+            pvs = self.k8s_client.list_pvs(label_selector=f"{SANDBOX_MANAGED_VOLUMES_LABEL}=server")
+        except Exception as e:
+            logger.warning(f"s3 orphan sweep: failed to list PVs: {e}")
+            return 0
+        deleted = 0
+        for pv in pvs:
+            name = getattr(getattr(pv, "metadata", None), "name", None)
+            claim_ref = getattr(getattr(pv, "spec", None), "claim_ref", None)
+            claim_ns = getattr(claim_ref, "namespace", None)
+            claim_name = getattr(claim_ref, "name", None)
+            if not name or not claim_ns or not claim_name:
+                continue
+            try:
+                if self.k8s_client.get_pvc(claim_ns, claim_name) is not None:
+                    continue
+                self.k8s_client.delete_pv(name)
+                deleted += 1
+                logger.info(f"s3 orphan sweep: deleted PV '{name}' (PVC {claim_ns}/{claim_name} is gone)")
+            except Exception as e:
+                logger.warning(f"s3 orphan sweep: failed for PV '{name}': {e}")
+        return deleted

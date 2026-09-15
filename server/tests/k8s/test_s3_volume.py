@@ -13,15 +13,26 @@
 # limitations under the License.
 
 from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+from fastapi import HTTPException
+from kubernetes.client import ApiException
 
 from opensandbox_server.api.schema import S3, Volume
 from opensandbox_server.config import StorageConfig
-from opensandbox_server.services.constants import SANDBOX_ID_LABEL, SANDBOX_MANAGED_VOLUMES_LABEL
+from opensandbox_server.services.constants import (
+    SANDBOX_ID_LABEL,
+    SANDBOX_MANAGED_VOLUMES_LABEL,
+    SandboxErrorCodes,
+)
 from opensandbox_server.services.k8s.s3_volume import (
+    S3VolumeProvisioner,
     build_s3_mount_options,
     build_s3_pv_body,
     build_s3_pvc_body,
     extract_failed_mount_message,
+    has_s3_volumes,
     normalize_s3_prefix,
     s3_object_name,
 )
@@ -168,3 +179,159 @@ class TestFailedMount:
     def test_none_when_no_failed_mount(self):
         assert extract_failed_mount_message("[t1] Normal   Pulled   image pulled") is None
         assert extract_failed_mount_message("(no events)") is None
+
+
+def _pv(name: str, sandbox_id: str, claim_ns: str = NS):
+    pv = MagicMock()
+    pv.metadata.name = name
+    pv.metadata.labels = {SANDBOX_MANAGED_VOLUMES_LABEL: "server", SANDBOX_ID_LABEL: sandbox_id}
+    pv.spec.claim_ref.namespace = claim_ns
+    pv.spec.claim_ref.name = name
+    return pv
+
+
+@pytest.fixture
+def provisioner():
+    client = MagicMock()
+    client.get_csi_driver.return_value = {"metadata": {"name": "s3.csi.aws.com"}}
+    client.get_pv.return_value = None
+    client.get_pvc.return_value = None
+    return S3VolumeProvisioner(client, StorageConfig())
+
+
+class TestHasS3Volumes:
+    def test_true_when_any_s3(self):
+        assert has_s3_volumes([_volume()]) is True
+
+    def test_false_for_none_or_other(self):
+        assert has_s3_volumes(None) is False
+        assert has_s3_volumes([]) is False
+
+
+class TestDriverCheck:
+    def test_missing_driver_is_unsupported_backend(self, provisioner):
+        provisioner.k8s_client.get_csi_driver.return_value = None
+        with pytest.raises(HTTPException) as exc:
+            provisioner.ensure_driver_installed()
+        assert exc.value.status_code == 400
+        assert exc.value.detail["code"] == SandboxErrorCodes.UNSUPPORTED_VOLUME_BACKEND
+        assert "s3.csi.aws.com" in exc.value.detail["message"]
+
+    def test_result_is_cached_after_success(self, provisioner):
+        provisioner.ensure_driver_installed()
+        provisioner.ensure_driver_installed()
+        assert provisioner.k8s_client.get_csi_driver.call_count == 1
+
+    def test_forbidden_is_api_error_naming_rbac(self, provisioner):
+        provisioner.k8s_client.get_csi_driver.side_effect = ApiException(status=403)
+        with pytest.raises(HTTPException) as exc:
+            provisioner.ensure_driver_installed()
+        assert exc.value.status_code == 500
+        assert exc.value.detail["code"] == SandboxErrorCodes.K8S_API_ERROR
+        assert "csidrivers" in exc.value.detail["message"]
+
+
+class TestEnsure:
+    def test_creates_pv_then_pvc_and_returns_claims(self, provisioner):
+        claims = provisioner.ensure([_volume()], SANDBOX_ID, NS)
+
+        assert claims == ["s3-abc123-logs"]
+        pv_body = provisioner.k8s_client.create_pv.call_args.args[0]
+        assert pv_body["metadata"]["name"] == "s3-abc123-logs"
+        ns, pvc_body = provisioner.k8s_client.create_pvc.call_args.args
+        assert ns == NS
+        assert pvc_body["metadata"]["name"] == "s3-abc123-logs"
+
+    def test_skips_non_s3_volumes(self, provisioner):
+        from opensandbox_server.api.schema import PVC
+
+        pvc_volume = Volume(name="d", pvc=PVC(claim_name="c"), mount_path="/d")
+        assert provisioner.ensure([pvc_volume], SANDBOX_ID, NS) == []
+        provisioner.k8s_client.create_pv.assert_not_called()
+
+    def test_conflict_with_matching_label_is_reused(self, provisioner):
+        provisioner.k8s_client.create_pv.side_effect = ApiException(status=409)
+        provisioner.k8s_client.get_pv.return_value = _pv("s3-abc123-logs", SANDBOX_ID)
+
+        claims = provisioner.ensure([_volume()], SANDBOX_ID, NS)
+
+        assert claims == ["s3-abc123-logs"]
+        provisioner.k8s_client.create_pvc.assert_called_once()
+
+    def test_conflict_with_other_sandbox_label_fails(self, provisioner):
+        provisioner.k8s_client.create_pv.side_effect = ApiException(status=409)
+        provisioner.k8s_client.get_pv.return_value = _pv("s3-abc123-logs", "other-sandbox")
+
+        with pytest.raises(HTTPException) as exc:
+            provisioner.ensure([_volume()], SANDBOX_ID, NS)
+        assert exc.value.status_code == 500
+        assert exc.value.detail["code"] == SandboxErrorCodes.K8S_API_ERROR
+        provisioner.k8s_client.create_pvc.assert_not_called()
+
+    def test_pvc_failure_rolls_back_pv(self, provisioner):
+        provisioner.k8s_client.create_pvc.side_effect = ApiException(status=500, reason="boom")
+
+        with pytest.raises(HTTPException) as exc:
+            provisioner.ensure([_volume()], SANDBOX_ID, NS)
+
+        assert exc.value.detail["code"] == SandboxErrorCodes.K8S_API_ERROR
+        provisioner.k8s_client.delete_pv.assert_called_once_with("s3-abc123-logs")
+
+    def test_second_volume_failure_rolls_back_first(self, provisioner):
+        provisioner.k8s_client.create_pv.side_effect = [None, ApiException(status=500, reason="boom")]
+        volumes = [
+            Volume(name="logs", s3=S3(bucket="bucket-one"), mount_path="/mnt/logs"),
+            Volume(name="data", s3=S3(bucket="bucket-two"), mount_path="/mnt/data"),
+        ]
+
+        with pytest.raises(HTTPException):
+            provisioner.ensure(volumes, SANDBOX_ID, NS)
+
+        provisioner.k8s_client.delete_pvc.assert_called_once_with(NS, "s3-abc123-logs")
+        provisioner.k8s_client.delete_pv.assert_called_once_with("s3-abc123-logs")
+
+    def test_forbidden_create_names_missing_rbac(self, provisioner):
+        provisioner.k8s_client.create_pv.side_effect = ApiException(status=403)
+        with pytest.raises(HTTPException) as exc:
+            provisioner.ensure([_volume()], SANDBOX_ID, NS)
+        assert "persistentvolumes" in exc.value.detail["message"]
+
+
+class TestCleanup:
+    def test_deletes_labeled_pvs(self, provisioner):
+        provisioner.k8s_client.list_pvs.return_value = [_pv("s3-abc123-logs", SANDBOX_ID)]
+
+        provisioner.cleanup(SANDBOX_ID)
+
+        provisioner.k8s_client.list_pvs.assert_called_once_with(
+            label_selector=f"{SANDBOX_MANAGED_VOLUMES_LABEL}=server,{SANDBOX_ID_LABEL}={SANDBOX_ID}"
+        )
+        provisioner.k8s_client.delete_pv.assert_called_once_with("s3-abc123-logs")
+
+    def test_errors_are_swallowed(self, provisioner):
+        provisioner.k8s_client.list_pvs.side_effect = ApiException(status=500)
+        provisioner.cleanup(SANDBOX_ID)  # no raise
+
+
+class TestSweepOrphans:
+    def test_deletes_pv_whose_pvc_is_gone(self, provisioner):
+        provisioner.k8s_client.list_pvs.return_value = [_pv("s3-abc123-logs", SANDBOX_ID)]
+        provisioner.k8s_client.get_pvc.return_value = None
+
+        deleted = provisioner.sweep_orphans()
+
+        assert deleted == 1
+        provisioner.k8s_client.get_pvc.assert_called_once_with(NS, "s3-abc123-logs")
+        provisioner.k8s_client.delete_pv.assert_called_once_with("s3-abc123-logs")
+
+    def test_keeps_pv_whose_pvc_exists(self, provisioner):
+        provisioner.k8s_client.list_pvs.return_value = [_pv("s3-abc123-logs", SANDBOX_ID)]
+        provisioner.k8s_client.get_pvc.return_value = MagicMock()
+
+        assert provisioner.sweep_orphans() == 0
+        provisioner.k8s_client.delete_pv.assert_not_called()
+
+    def test_only_lists_server_managed_pvs(self, provisioner):
+        provisioner.k8s_client.list_pvs.return_value = []
+        provisioner.sweep_orphans()
+        provisioner.k8s_client.list_pvs.assert_called_once_with(label_selector=f"{SANDBOX_MANAGED_VOLUMES_LABEL}=server")
