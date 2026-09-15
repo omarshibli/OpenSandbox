@@ -104,6 +104,11 @@ from opensandbox_server.services.k8s.client import (
     POOL_PLURAL,
 )
 from opensandbox_server.services.k8s.provider_factory import create_workload_provider
+from opensandbox_server.services.k8s.s3_volume import (
+    S3VolumeProvisioner,
+    extract_failed_mount_message,
+    has_s3_volumes,
+)
 from opensandbox_server.services.snapshot_restore import resolve_sandbox_image_from_request
 from opensandbox_server.tenants.context import get_current_tenant
 from opensandbox_server.tenants.provider import TenantProvider
@@ -157,6 +162,7 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
 
         try:
             self.k8s_client = K8sClient(self.app_config.kubernetes)
+            self._s3_volumes = S3VolumeProvisioner(self.k8s_client, self.app_config.storage)
             logger.info("Kubernetes client initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize Kubernetes client: {e}")
@@ -898,7 +904,13 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             ensure_volumes_valid(
                 request.volumes,
                 self.app_config.storage.allowed_host_paths,
+                allowed_s3_buckets=self.app_config.storage.s3_allowed_buckets,
             )
+
+            # Fail fast with a clear error when the cluster has no S3 CSI
+            # driver — before any side effect.
+            if has_s3_volumes(request.volumes):
+                await asyncio.to_thread(self._s3_volumes.ensure_driver_installed)
 
             # Reject poolRef + volumes here, before _ensure_pvc_volumes runs.
             # The provider also rejects this combination but raises
@@ -928,6 +940,16 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 created_managed_pvcs = await asyncio.to_thread(
                     self._ensure_pvc_volumes, request.volumes, sandbox_id
                 )
+
+            if has_s3_volumes(request.volumes):
+                managed_pvcs_may_exist = True
+                s3_claims = await asyncio.to_thread(
+                    self._s3_volumes.ensure,
+                    request.volumes or [],
+                    sandbox_id,
+                    self._resolve_namespace(),
+                )
+                created_managed_pvcs.extend(s3_claims)
 
             # Create the workload CR. Three failure modes drive PVC cleanup:
             #   1. ``ValueError`` — provider preflight rejection (poolRef+volumes,
@@ -1067,6 +1089,17 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
                 return response
 
             except HTTPException as e:
+                detail = e.detail if isinstance(e.detail, dict) else None
+                if (
+                    detail is not None
+                    and detail.get("code") == SandboxErrorCodes.K8S_POD_READY_TIMEOUT
+                    and has_s3_volumes(request.volumes)
+                ):
+                    hint = await asyncio.to_thread(self._s3_failed_mount_hint, sandbox_id)
+                    if hint:
+                        detail["message"] = (
+                            f"{detail.get('message', '')} Last FailedMount event: {hint}"
+                        )
                 try:
                     logger.error(f"Creation failed, cleaning up sandbox {sandbox_id}: {e}")
                     await asyncio.to_thread(
@@ -1250,52 +1283,65 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
         """
         from kubernetes.client import ApiException
 
-        selector = (
-            f"{SANDBOX_MANAGED_VOLUMES_LABEL}=server,"
-            f"{SANDBOX_ID_LABEL}={sandbox_id}"
-        )
         try:
-            pvcs = self.k8s_client.list_pvcs(self._resolve_namespace(), label_selector=selector)
-        except ApiException as e:
-            if e.status == 403:
-                logger.debug(
-                    f"No RBAC permission to list PVCs, skipping managed-PVC cleanup for sandbox {sandbox_id}"
-                )
-                return
-            logger.warning(
-                f"Failed to list managed PVCs for sandbox {sandbox_id}: {e}"
+            selector = (
+                f"{SANDBOX_MANAGED_VOLUMES_LABEL}=server,"
+                f"{SANDBOX_ID_LABEL}={sandbox_id}"
             )
-            return
-        except Exception as e:
-            logger.warning(
-                f"Failed to list managed PVCs for sandbox {sandbox_id}: {e}"
-            )
-            return
-
-        for pvc in pvcs:
-            metadata = getattr(pvc, "metadata", None)
-            name = getattr(metadata, "name", None) if metadata is not None else None
-            if not name:
-                continue
             try:
-                self.k8s_client.delete_pvc(self._resolve_namespace(), name)
-                logger.info(
-                    f"sandbox={sandbox_id} | deleted managed PVC '{name}' in namespace '{self._resolve_namespace()}'"
-                )
+                pvcs = self.k8s_client.list_pvcs(self._resolve_namespace(), label_selector=selector)
             except ApiException as e:
                 if e.status == 403:
-                    logger.warning(
-                        f"sandbox={sandbox_id} | no RBAC permission to delete PVC '{name}', skipping"
+                    logger.debug(
+                        f"No RBAC permission to list PVCs, skipping managed-PVC cleanup for sandbox {sandbox_id}"
                     )
-                    return  # Same SA — no point trying the rest
+                    return
                 logger.warning(
-                    f"sandbox={sandbox_id} | failed to delete managed PVC '{name}': {e}"
+                    f"Failed to list managed PVCs for sandbox {sandbox_id}: {e}"
                 )
+                return
             except Exception as e:
                 logger.warning(
-                    f"sandbox={sandbox_id} | failed to delete managed PVC '{name}': {e}"
+                    f"Failed to list managed PVCs for sandbox {sandbox_id}: {e}"
                 )
-    
+                return
+
+            for pvc in pvcs:
+                metadata = getattr(pvc, "metadata", None)
+                name = getattr(metadata, "name", None) if metadata is not None else None
+                if not name:
+                    continue
+                try:
+                    self.k8s_client.delete_pvc(self._resolve_namespace(), name)
+                    logger.info(
+                        f"sandbox={sandbox_id} | deleted managed PVC '{name}' in namespace '{self._resolve_namespace()}'"
+                    )
+                except ApiException as e:
+                    if e.status == 403:
+                        logger.warning(
+                            f"sandbox={sandbox_id} | no RBAC permission to delete PVC '{name}', skipping"
+                        )
+                        return  # Same SA — no point trying the rest
+                    logger.warning(
+                        f"sandbox={sandbox_id} | failed to delete managed PVC '{name}': {e}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"sandbox={sandbox_id} | failed to delete managed PVC '{name}': {e}"
+                    )
+        finally:
+            # PVs are cluster-scoped and have no ownerReference, so K8s GC
+            # never removes them; delete them here.
+            self._s3_volumes.cleanup(sandbox_id)
+
+    def _s3_failed_mount_hint(self, sandbox_id: str) -> Optional[str]:
+        """Last FailedMount event message for the sandbox pod, or None. Never raises."""
+        try:
+            return extract_failed_mount_message(self.get_sandbox_events(sandbox_id))
+        except Exception as e:
+            logger.debug(f"sandbox={sandbox_id} | could not read pod events for FailedMount hint: {e}")
+            return None
+
     def pause_sandbox(self, sandbox_id: str) -> None:
         """
         Pause sandbox by delegating to the workload provider.

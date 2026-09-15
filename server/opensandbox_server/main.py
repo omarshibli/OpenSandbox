@@ -19,6 +19,7 @@ This module initializes the FastAPI application with middleware, routes,
 and configuration for the sandbox lifecycle management service.
 """
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -176,6 +177,18 @@ async def lifespan(app: FastAPI):
             docker_client=docker_client,
             k8s_client=k8s_client,
         )
+
+        if k8s_client is not None:
+            from opensandbox_server.services.k8s.s3_volume import S3VolumeProvisioner
+
+            try:
+                deleted = await asyncio.to_thread(
+                    S3VolumeProvisioner(k8s_client, app_config.storage).sweep_orphans
+                )
+                if deleted:
+                    logger.info("Startup sweep removed %d orphaned s3 PersistentVolumes", deleted)
+            except Exception as sweep_exc:
+                logger.warning("Startup sweep of s3 PersistentVolumes failed: %s", sweep_exc)
 
     except Exception as exc:
         logger.error("Secure runtime validation failed: %s", exc)

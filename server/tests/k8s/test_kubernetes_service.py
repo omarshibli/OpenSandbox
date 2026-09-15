@@ -31,11 +31,16 @@ from opensandbox_server.services.constants import (
     SandboxErrorCodes,
 )
 from opensandbox_server.api.schema import (
+    S3,
+    CreateSandboxRequest,
     CredentialProxyConfig,
     ImageAuth,
+    ImageSpec,
     ListSandboxesRequest,
     NetworkPolicy,
     PlatformSpec,
+    ResourceLimits,
+    Volume,
 )
 from opensandbox_server.config import (
     EGRESS_MODE_DNS,
@@ -2693,3 +2698,127 @@ class TestPatchSandboxMetadata:
         assert sandbox.metadata == {"env": "stage"}
         # Pre-patch read only; no second get_workload after patch_labels.
         assert k8s_service.workload_provider.get_workload.call_count == 1
+
+
+class TestS3VolumeWiring:
+    def _s3_volume(self):
+        return Volume(name="logs", s3=S3(bucket="my-team-sandbox-logs"), mount_path="/mnt/logs")
+
+    def test_cleanup_managed_pvcs_also_cleans_s3_pvs(self, k8s_service):
+        k8s_service.k8s_client.list_pvcs.return_value = []
+        k8s_service._s3_volumes = MagicMock()
+
+        k8s_service._cleanup_managed_pvcs("sandbox-xyz")
+
+        k8s_service._s3_volumes.cleanup.assert_called_once_with("sandbox-xyz")
+
+    def test_cleanup_managed_pvcs_cleans_s3_pvs_when_listing_fails(self, k8s_service):
+        k8s_service.k8s_client.list_pvcs.side_effect = RuntimeError("api down")
+        k8s_service._s3_volumes = MagicMock()
+
+        k8s_service._cleanup_managed_pvcs("sandbox-xyz")
+
+        k8s_service._s3_volumes.cleanup.assert_called_once_with("sandbox-xyz")
+
+    def test_failed_mount_hint_uses_pod_events(self, k8s_service):
+        k8s_service.get_sandbox_events = MagicMock(
+            return_value='[t] Warning  FailedMount  MountVolume.SetUp failed for volume "logs": access denied'
+        )
+        assert k8s_service._s3_failed_mount_hint("sandbox-xyz") == 'MountVolume.SetUp failed for volume "logs": access denied'
+
+    def test_failed_mount_hint_swallows_errors(self, k8s_service):
+        k8s_service.get_sandbox_events = MagicMock(side_effect=RuntimeError("no pod"))
+        assert k8s_service._s3_failed_mount_hint("sandbox-xyz") is None
+
+    @pytest.mark.asyncio
+    async def test_create_checks_driver_and_provisions_before_workload(self, k8s_service):
+        k8s_service._s3_volumes = MagicMock()
+        k8s_service._s3_volumes.ensure.return_value = ["s3-id-logs"]
+        k8s_service._attach_pvc_owner_references = MagicMock()
+        k8s_service.workload_provider.create_workload.side_effect = ValueError("stop here")
+
+        request = CreateSandboxRequest(
+            image=ImageSpec(uri="python:3.11"),
+            timeout=60,
+            resourceLimits=ResourceLimits(root={}),
+            entrypoint=["python"],
+            volumes=[self._s3_volume()],
+        )
+        with pytest.raises(HTTPException):
+            await k8s_service.create_sandbox(request)
+
+        k8s_service._s3_volumes.ensure_driver_installed.assert_called_once()
+        k8s_service._s3_volumes.ensure.assert_called_once()
+        args = k8s_service._s3_volumes.ensure.call_args.args
+        assert args[0] == request.volumes
+        assert isinstance(args[1], str) and args[2] == k8s_service._resolve_namespace()
+
+    @pytest.mark.asyncio
+    async def test_create_adds_s3_claims_to_owner_reference_targets(self, k8s_service):
+        k8s_service._s3_volumes = MagicMock()
+        k8s_service._s3_volumes.ensure.return_value = ["s3-id-logs"]
+        k8s_service._ensure_pvc_volumes = MagicMock(return_value=[])
+        k8s_service._attach_pvc_owner_references = MagicMock()
+        k8s_service.workload_provider.create_workload.return_value = {"name": "sbx"}
+        k8s_service._wait_for_sandbox_ready = MagicMock(
+            side_effect=RuntimeError("stop after owner refs")
+        )
+
+        request = CreateSandboxRequest(
+            image=ImageSpec(uri="python:3.11"),
+            timeout=60,
+            resourceLimits=ResourceLimits(root={}),
+            entrypoint=["python"],
+            volumes=[self._s3_volume()],
+        )
+        with pytest.raises(HTTPException):
+            await k8s_service.create_sandbox(request)
+
+        assert k8s_service._attach_pvc_owner_references.call_args.args[0] == ["s3-id-logs"]
+
+    @pytest.mark.asyncio
+    async def test_create_without_s3_does_not_touch_driver(self, k8s_service):
+        k8s_service._s3_volumes = MagicMock()
+        k8s_service.workload_provider.create_workload.side_effect = ValueError("stop here")
+
+        request = CreateSandboxRequest(
+            image=ImageSpec(uri="python:3.11"),
+            timeout=60,
+            resourceLimits=ResourceLimits(root={}),
+            entrypoint=["python"],
+        )
+        with pytest.raises(HTTPException):
+            await k8s_service.create_sandbox(request)
+
+        k8s_service._s3_volumes.ensure_driver_installed.assert_not_called()
+        k8s_service._s3_volumes.ensure.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ready_timeout_appends_failed_mount_hint(self, k8s_service):
+        k8s_service._s3_volumes = MagicMock()
+        k8s_service._s3_volumes.ensure.return_value = []
+        k8s_service._ensure_pvc_volumes = MagicMock(return_value=[])
+        k8s_service._attach_pvc_owner_references = MagicMock()
+        k8s_service.workload_provider.create_workload.return_value = {"name": "sbx"}
+        timeout_error = HTTPException(
+            status_code=504,
+            detail={
+                "code": SandboxErrorCodes.K8S_POD_READY_TIMEOUT,
+                "message": "Sandbox did not become ready in time.",
+            },
+        )
+        k8s_service._wait_for_sandbox_ready = MagicMock(side_effect=timeout_error)
+        k8s_service._s3_failed_mount_hint = MagicMock(return_value="access denied")
+
+        request = CreateSandboxRequest(
+            image=ImageSpec(uri="python:3.11"),
+            timeout=60,
+            resourceLimits=ResourceLimits(root={}),
+            entrypoint=["python"],
+            volumes=[self._s3_volume()],
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            await k8s_service.create_sandbox(request)
+
+        detail = cast(dict, exc_info.value.detail)
+        assert detail["message"].endswith("Last FailedMount event: access denied")
