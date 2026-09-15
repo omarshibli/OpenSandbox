@@ -821,6 +821,47 @@ class StorageConfig(BaseModel):
             "'ossfs_mount_root/<bucket>/<volume.subPath?>'."
         ),
     )
+    s3_csi_driver: str = Field(
+        default="s3.csi.aws.com",
+        description=(
+            "Name of the CSIDriver object used for s3 volumes (Mountpoint for Amazon S3 CSI driver). "
+            "The server checks that it exists before creating s3 volumes."
+        ),
+    )
+    s3_mount_options: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Operator-provided Mountpoint mount options added to every s3 volume "
+            "(e.g. 'uid=1000'). Raw payloads without leading '-'. Server-owned options "
+            "(prefix, region, read-only, allow-delete, allow-overwrite) are rejected."
+        ),
+    )
+    s3_allowed_buckets: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Allowlist of S3 bucket names permitted for s3 volumes. "
+            "If empty, any bucket is allowed; the IAM role bound to the CSI driver is the boundary."
+        ),
+    )
+
+    @field_validator("s3_mount_options")
+    @classmethod
+    def _validate_s3_mount_options(cls, options: list[str]) -> list[str]:
+        reserved = {"prefix", "region", "read-only", "allow-delete", "allow-overwrite"}
+        for option in options:
+            normalized = option.strip()
+            if not normalized:
+                raise ValueError("storage.s3_mount_options entries must be non-empty")
+            if normalized.startswith("-"):
+                raise ValueError(
+                    f"storage.s3_mount_options entry '{option}' must not have a '-' prefix"
+                )
+            for token in re.split(r"[\s=]+", normalized):
+                if token.lower() in reserved:
+                    raise ValueError(
+                        f"storage.s3_mount_options entry '{option}' uses reserved option '{token}'"
+                    )
+        return options
 
 DEFAULT_EGRESS_DISABLE_IPV6 = True
 
