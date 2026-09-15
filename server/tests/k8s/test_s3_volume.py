@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -27,6 +28,7 @@ from opensandbox_server.services.constants import (
     SandboxErrorCodes,
 )
 from opensandbox_server.services.k8s.s3_volume import (
+    S3_ORPHAN_PV_MIN_AGE_SECONDS,
     S3VolumeProvisioner,
     build_s3_mount_options,
     build_s3_pv_body,
@@ -181,10 +183,18 @@ class TestFailedMount:
         assert extract_failed_mount_message("(no events)") is None
 
 
-def _pv(name: str, sandbox_id: str, claim_ns: str = NS):
+def _pv(
+    name: str,
+    sandbox_id: str,
+    claim_ns: str = NS,
+    phase: str = "Available",
+    age_seconds: float = 3600.0,
+):
     pv = MagicMock()
     pv.metadata.name = name
     pv.metadata.labels = {SANDBOX_MANAGED_VOLUMES_LABEL: "server", SANDBOX_ID_LABEL: sandbox_id}
+    pv.metadata.creation_timestamp = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    pv.status.phase = phase
     pv.spec.claim_ref.namespace = claim_ns
     pv.spec.claim_ref.name = name
     return pv
@@ -296,9 +306,22 @@ class TestEnsure:
             provisioner.ensure([_volume()], SANDBOX_ID, NS)
         assert "persistentvolumes" in exc.value.detail["message"]
 
+    def test_conflict_with_unreadable_pv_says_retry(self, provisioner):
+        provisioner.k8s_client.create_pv.side_effect = ApiException(status=409)
+        provisioner.k8s_client.get_pv.return_value = None
+
+        with pytest.raises(HTTPException) as exc:
+            provisioner.ensure([_volume()], SANDBOX_ID, NS)
+
+        assert exc.value.status_code == 500
+        assert exc.value.detail["code"] == SandboxErrorCodes.K8S_API_ERROR
+        assert "could not be read back" in exc.value.detail["message"]
+        provisioner.k8s_client.create_pvc.assert_not_called()
+
 
 class TestCleanup:
     def test_deletes_labeled_pvs(self, provisioner):
+        provisioner._provisioned_any = True
         provisioner.k8s_client.list_pvs.return_value = [_pv("s3-abc123-logs", SANDBOX_ID)]
 
         provisioner.cleanup(SANDBOX_ID)
@@ -309,8 +332,29 @@ class TestCleanup:
         provisioner.k8s_client.delete_pv.assert_called_once_with("s3-abc123-logs")
 
     def test_errors_are_swallowed(self, provisioner):
+        provisioner._provisioned_any = True
         provisioner.k8s_client.list_pvs.side_effect = ApiException(status=500)
         provisioner.cleanup(SANDBOX_ID)  # no raise
+
+    def test_fresh_provisioner_does_not_list_pvs(self, provisioner):
+        provisioner.cleanup(SANDBOX_ID)
+        provisioner.k8s_client.list_pvs.assert_not_called()
+
+    def test_lists_pvs_after_ensure_provisioned(self, provisioner):
+        provisioner.ensure([_volume()], SANDBOX_ID, NS)
+        provisioner.k8s_client.list_pvs.return_value = []
+
+        provisioner.cleanup(SANDBOX_ID)
+
+        provisioner.k8s_client.list_pvs.assert_called_once()
+
+    def test_lists_pvs_after_driver_verified(self, provisioner):
+        provisioner.ensure_driver_installed()
+        provisioner.k8s_client.list_pvs.return_value = []
+
+        provisioner.cleanup(SANDBOX_ID)
+
+        provisioner.k8s_client.list_pvs.assert_called_once()
 
 
 class TestSweepOrphans:
@@ -327,6 +371,51 @@ class TestSweepOrphans:
     def test_keeps_pv_whose_pvc_exists(self, provisioner):
         provisioner.k8s_client.list_pvs.return_value = [_pv("s3-abc123-logs", SANDBOX_ID)]
         provisioner.k8s_client.get_pvc.return_value = MagicMock()
+
+        assert provisioner.sweep_orphans() == 0
+        provisioner.k8s_client.delete_pv.assert_not_called()
+
+    def test_keeps_young_available_pv_that_may_still_be_binding(self, provisioner):
+        provisioner.k8s_client.list_pvs.return_value = [
+            _pv("s3-abc123-logs", SANDBOX_ID, phase="Available", age_seconds=30)
+        ]
+        provisioner.k8s_client.get_pvc.return_value = None
+
+        assert provisioner.sweep_orphans() == 0
+        provisioner.k8s_client.delete_pv.assert_not_called()
+
+    def test_deletes_old_available_pv(self, provisioner):
+        provisioner.k8s_client.list_pvs.return_value = [
+            _pv("s3-abc123-logs", SANDBOX_ID, phase="Available", age_seconds=S3_ORPHAN_PV_MIN_AGE_SECONDS + 600)
+        ]
+        provisioner.k8s_client.get_pvc.return_value = None
+
+        assert provisioner.sweep_orphans() == 1
+        provisioner.k8s_client.delete_pv.assert_called_once_with("s3-abc123-logs")
+
+    def test_deletes_young_released_pv(self, provisioner):
+        provisioner.k8s_client.list_pvs.return_value = [
+            _pv("s3-abc123-logs", SANDBOX_ID, phase="Released", age_seconds=30)
+        ]
+        provisioner.k8s_client.get_pvc.return_value = None
+
+        assert provisioner.sweep_orphans() == 1
+        provisioner.k8s_client.delete_pv.assert_called_once_with("s3-abc123-logs")
+
+    def test_never_deletes_bound_pv(self, provisioner):
+        provisioner.k8s_client.list_pvs.return_value = [
+            _pv("s3-abc123-logs", SANDBOX_ID, phase="Bound", age_seconds=86400)
+        ]
+        provisioner.k8s_client.get_pvc.return_value = None
+
+        assert provisioner.sweep_orphans() == 0
+        provisioner.k8s_client.delete_pv.assert_not_called()
+
+    def test_missing_creation_timestamp_keeps_pv(self, provisioner):
+        pv = _pv("s3-abc123-logs", SANDBOX_ID, phase="Available")
+        pv.metadata.creation_timestamp = None
+        provisioner.k8s_client.list_pvs.return_value = [pv]
+        provisioner.k8s_client.get_pvc.return_value = None
 
         assert provisioner.sweep_orphans() == 0
         provisioner.k8s_client.delete_pv.assert_not_called()

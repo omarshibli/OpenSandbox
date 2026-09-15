@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 from fastapi import HTTPException, status
@@ -45,6 +46,13 @@ _READ_ONLY_ACCESS_MODES = ["ReadOnlyMany"]
 # One line of ``get_sandbox_events`` output: "[<timestamp>] <TYPE> <REASON> <MESSAGE>".
 # The timestamp may contain spaces, so anchor on the closing bracket.
 _EVENT_LINE_RE = re.compile(r"^\[.*?\]\s+(\S+)\s+(\S+)\s+(.*)$")
+# ``build_s3_pv_body`` pre-sets ``claimRef``, so between ``create_pv`` and
+# ``create_pvc`` a healthy PV looks exactly like an orphan. The sweep only
+# deletes a still-Available PV once it is older than this, which keeps a
+# restarting replica from deleting another replica's in-flight PV.
+S3_ORPHAN_PV_MIN_AGE_SECONDS = 600
+# Phases that mean the PVC is definitively gone; age no longer matters.
+_S3_ORPHAN_PV_TERMINAL_PHASES = ("Released", "Failed")
 
 
 def s3_object_name(sandbox_id: str, volume_name: str) -> str:
@@ -146,6 +154,18 @@ def extract_failed_mount_message(events_text: str) -> Optional[str]:
     return last
 
 
+def _is_older_than(pv: Any, seconds: int) -> bool:
+    """
+    True when the PV's creationTimestamp is more than ``seconds`` in the past.
+    A missing or unreadable timestamp counts as "too young to delete".
+    """
+    created = getattr(getattr(pv, "metadata", None), "creation_timestamp", None)
+    if not isinstance(created, datetime):
+        return False
+    now = datetime.now(timezone.utc) if created.tzinfo is not None else datetime.now()
+    return (now - created).total_seconds() > seconds
+
+
 def has_s3_volumes(volumes: Optional[List[Volume]]) -> bool:
     return any(v.s3 is not None for v in (volumes or []))
 
@@ -158,13 +178,16 @@ class S3VolumeProvisioner:
     existing label sweep and ``ownerReferences`` GC remove them. PVs are
     cluster-scoped and cannot be owned by a namespaced CR, so ``cleanup``
     deletes them explicitly and ``sweep_orphans`` catches leftovers at
-    startup.
+    startup and on a timer.
     """
 
     def __init__(self, k8s_client: Any, storage: StorageConfig):
         self.k8s_client = k8s_client
         self.storage = storage
         self._driver_verified = False
+        # True once this process touched an s3 object. Keeps ``cleanup`` from
+        # LISTing PVs cluster-wide in deployments that never use s3 volumes.
+        self._provisioned_any = False
 
     # -- driver -----------------------------------------------------------
 
@@ -226,6 +249,7 @@ class S3VolumeProvisioner:
                 name = s3_object_name(sandbox_id, volume.name)
                 if self._create_or_reuse_pv(build_s3_pv_body(volume, sandbox_id, namespace, self.storage), sandbox_id):
                     created_pvs.append(name)
+                self._provisioned_any = True
                 if self._create_or_reuse_pvc(
                     build_s3_pvc_body(volume, sandbox_id, namespace, self.storage), sandbox_id, namespace
                 ):
@@ -267,10 +291,20 @@ class S3VolumeProvisioner:
 
     @staticmethod
     def _assert_owned_by(obj: Any, name: str, sandbox_id: str, *, kind: str) -> None:
+        if obj is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={
+                    "code": SandboxErrorCodes.K8S_API_ERROR,
+                    "message": (
+                        f"{kind} '{name}' reported a conflict on create but could not be "
+                        "read back; retry the request."
+                    ),
+                },
+            )
         labels = getattr(getattr(obj, "metadata", None), "labels", None) or {}
         if (
-            obj is None
-            or labels.get(SANDBOX_ID_LABEL) != sandbox_id
+            labels.get(SANDBOX_ID_LABEL) != sandbox_id
             or labels.get(SANDBOX_MANAGED_VOLUMES_LABEL) != "server"
         ):
             raise HTTPException(
@@ -313,12 +347,26 @@ class S3VolumeProvisioner:
     # -- cleanup ----------------------------------------------------------
 
     def cleanup(self, sandbox_id: str) -> None:
-        """Delete the PVs labeled for this sandbox. Best effort; never raises."""
+        """
+        Delete the PVs labeled for this sandbox. Best effort; never raises.
+
+        Returns without a cluster-wide LIST when this process never saw an s3
+        volume: a deployment without s3 volumes must not pay for (or need RBAC
+        for) a PV list on every sandbox delete. Sandboxes provisioned before a
+        restart are still cleaned up — their PVC goes with the label sweep and
+        ``sweep_orphans`` removes the Released PV.
+        """
+        if not (self._driver_verified or self._provisioned_any):
+            logger.debug(f"sandbox={sandbox_id} | no s3 volumes in this process; skipping s3 PV cleanup")
+            return
         selector = f"{SANDBOX_MANAGED_VOLUMES_LABEL}=server,{SANDBOX_ID_LABEL}={sandbox_id}"
         try:
             pvs = self.k8s_client.list_pvs(label_selector=selector)
         except Exception as e:
-            logger.warning(f"sandbox={sandbox_id} | failed to list s3 PVs: {e}")
+            if getattr(e, "status", None) == 403:
+                logger.debug(f"sandbox={sandbox_id} | no RBAC to list persistentvolumes; skipping s3 PV cleanup")
+            else:
+                logger.warning(f"sandbox={sandbox_id} | failed to list s3 PVs: {e}")
             return
         for pv in pvs:
             name = getattr(getattr(pv, "metadata", None), "name", None)
@@ -333,7 +381,14 @@ class S3VolumeProvisioner:
     def sweep_orphans(self) -> int:
         """
         Delete server-managed PVs whose bound PVC no longer exists (for
-        example, removed by ownerReference GC while the server was down).
+        example, removed by ownerReference GC after a TTL expiry).
+
+        A ``Bound`` PV is never deleted. A PV in any other phase is deleted
+        only once the PVC is confirmed missing AND the PV is already
+        ``Released``/``Failed`` or older than
+        ``S3_ORPHAN_PV_MIN_AGE_SECONDS``, so a PV that ``ensure`` is still
+        binding survives a concurrent sweep.
+
         Returns the number of PVs deleted. Best effort; never raises.
         """
         try:
@@ -349,8 +404,19 @@ class S3VolumeProvisioner:
             claim_name = getattr(claim_ref, "name", None)
             if not name or not claim_ns or not claim_name:
                 continue
+            phase = getattr(getattr(pv, "status", None), "phase", None)
+            if phase == "Bound":
+                continue
             try:
                 if self.k8s_client.get_pvc(claim_ns, claim_name) is not None:
+                    continue
+                if phase not in _S3_ORPHAN_PV_TERMINAL_PHASES and not _is_older_than(
+                    pv, S3_ORPHAN_PV_MIN_AGE_SECONDS
+                ):
+                    logger.debug(
+                        f"s3 orphan sweep: keeping PV '{name}' (phase={phase}), younger than "
+                        f"{S3_ORPHAN_PV_MIN_AGE_SECONDS}s and possibly still being bound"
+                    )
                     continue
                 self.k8s_client.delete_pv(name)
                 deleted += 1

@@ -844,6 +844,17 @@ class StorageConfig(BaseModel):
         ),
     )
 
+    s3_orphan_sweep_interval_seconds: int = Field(
+        default=900,
+        ge=0,
+        description=(
+            "Interval in seconds between background sweeps that delete server-managed s3 "
+            "PersistentVolumes whose PersistentVolumeClaim is gone (for example after a TTL "
+            "expiry removed the claim through ownerReferences). 0 disables the periodic sweep; "
+            "the startup sweep always runs."
+        ),
+    )
+
     @field_validator("s3_mount_options")
     @classmethod
     def _validate_s3_mount_options(cls, options: list[str]) -> list[str]:

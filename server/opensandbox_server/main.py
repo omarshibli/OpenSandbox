@@ -22,7 +22,7 @@ and configuration for the sandbox lifecycle management service.
 import asyncio
 import logging
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 import httpx
@@ -110,6 +110,22 @@ from opensandbox_server.services.runtime_resolver import (  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+async def _sweep_s3_orphan_pvs_periodically(provisioner: Any, interval_seconds: int) -> None:
+    """
+    Re-run the s3 orphan PV sweep forever. Controller-driven TTL expiry never
+    calls ``delete_sandbox``, so the PVC goes with ownerReference GC and the
+    Released PV would otherwise sit there until the next restart.
+    """
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            deleted = await asyncio.to_thread(provisioner.sweep_orphans)
+            if deleted:
+                logger.info("Periodic sweep removed %d orphaned s3 PersistentVolumes", deleted)
+        except Exception as sweep_exc:
+            logger.warning("Periodic sweep of s3 PersistentVolumes failed: %s", sweep_exc)
+
+
 class _DateHeaderFastAPI(FastAPI):
     """Keep Date handling outside Starlette's server error middleware."""
 
@@ -181,14 +197,19 @@ async def lifespan(app: FastAPI):
         if k8s_client is not None:
             from opensandbox_server.services.k8s.s3_volume import S3VolumeProvisioner
 
+            s3_provisioner = S3VolumeProvisioner(k8s_client, app_config.storage)
             try:
-                deleted = await asyncio.to_thread(
-                    S3VolumeProvisioner(k8s_client, app_config.storage).sweep_orphans
-                )
+                deleted = await asyncio.to_thread(s3_provisioner.sweep_orphans)
                 if deleted:
                     logger.info("Startup sweep removed %d orphaned s3 PersistentVolumes", deleted)
             except Exception as sweep_exc:
                 logger.warning("Startup sweep of s3 PersistentVolumes failed: %s", sweep_exc)
+
+            sweep_interval = app_config.storage.s3_orphan_sweep_interval_seconds
+            if sweep_interval > 0:
+                app.state.s3_sweep_task = asyncio.create_task(
+                    _sweep_s3_orphan_pvs_periodically(s3_provisioner, sweep_interval)
+                )
 
     except Exception as exc:
         logger.error("Secure runtime validation failed: %s", exc)
@@ -210,6 +231,12 @@ async def lifespan(app: FastAPI):
     setup_otel_metrics(app_config.otel)
 
     yield
+
+    sweep_task = getattr(app.state, "s3_sweep_task", None)
+    if sweep_task is not None:
+        sweep_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await sweep_task
 
     consumer = getattr(app.state, "renew_intent_consumer", None)
     if consumer is not None:
