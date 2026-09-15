@@ -322,6 +322,50 @@ public class ModelsTests
     }
 
     [Fact]
+    public void Volume_WithS3_ShouldSerializeExpectedPayload()
+    {
+        var request = new CreateSandboxRequest
+        {
+            Image = new ImageSpec { Uri = "python:3.11" },
+            ResourceLimits = new Dictionary<string, string>(),
+            Entrypoint = new List<string> { "python" },
+            Volumes = new List<Volume>
+            {
+                new()
+                {
+                    Name = "logs",
+                    MountPath = "/mnt/logs",
+                    S3 = new S3
+                    {
+                        Bucket = "my-team-sandbox-logs",
+                        Prefix = "sandboxes/task-001/",
+                        Region = "eu-west-1",
+                        Options = new List<string> { "uid=1000" }
+                    }
+                }
+            }
+        };
+
+        // The models carry no per-property [JsonIgnore]; they rely on the
+        // WhenWritingNull condition the SDK adapters configure, so the
+        // "backend not set" assertions below use the same options.
+        string json = JsonSerializer.Serialize(
+            request,
+            new JsonSerializerOptions
+            {
+                DefaultIgnoreCondition =
+                    System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+            });
+
+        json.Should().Contain("\"s3\":");
+        json.Should().Contain("\"bucket\":\"my-team-sandbox-logs\"");
+        json.Should().Contain("\"prefix\":\"sandboxes/task-001/\"");
+        json.Should().Contain("\"region\":\"eu-west-1\"");
+        json.Should().NotContain("\"ossfs\":");
+        json.Should().NotContain("accessKeyId");
+    }
+
+    [Fact]
     public void SandboxMetrics_ShouldStoreProperties()
     {
         // Arrange & Act

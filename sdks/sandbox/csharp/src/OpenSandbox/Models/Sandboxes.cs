@@ -640,8 +640,39 @@ public class OSSFS
 }
 
 /// <summary>
+/// Amazon S3 mount backend. Kubernetes runtime only; credentials come from the
+/// IAM role bound to the CSI driver ServiceAccount.
+/// </summary>
+public class S3
+{
+    /// <summary>
+    /// Gets or sets the S3 bucket name.
+    /// </summary>
+    [JsonPropertyName("bucket")]
+    public required string Bucket { get; set; }
+
+    /// <summary>
+    /// Gets or sets the optional key prefix to mount (relative, no leading '/').
+    /// </summary>
+    [JsonPropertyName("prefix")]
+    public string? Prefix { get; set; }
+
+    /// <summary>
+    /// Gets or sets the optional AWS region, e.g. "eu-west-1".
+    /// </summary>
+    [JsonPropertyName("region")]
+    public string? Region { get; set; }
+
+    /// <summary>
+    /// Gets or sets additional Mountpoint mount options without leading '-'.
+    /// </summary>
+    [JsonPropertyName("options")]
+    public IReadOnlyList<string>? Options { get; set; }
+}
+
+/// <summary>
 /// Storage mount definition for sandbox creation.
-/// Exactly one backend (Host, PVC, or OSSFS) should be provided per volume.
+/// Exactly one backend (Host, PVC, OSSFS, or S3) should be provided per volume.
 /// </summary>
 public class Volume
 {
@@ -668,6 +699,12 @@ public class Volume
     /// </summary>
     [JsonPropertyName("ossfs")]
     public OSSFS? Ossfs { get; set; }
+
+    /// <summary>
+    /// Gets or sets the Amazon S3 backend configuration (Kubernetes runtime only).
+    /// </summary>
+    [JsonPropertyName("s3")]
+    public S3? S3 { get; set; }
 
     /// <summary>
     /// Gets or sets the absolute mount path inside the container.
