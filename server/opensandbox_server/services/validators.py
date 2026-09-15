@@ -31,7 +31,7 @@ from fastapi import HTTPException, status
 from opensandbox_server.services.constants import RESERVED_LABEL_PREFIX, SandboxErrorCodes
 
 if TYPE_CHECKING:
-    from opensandbox_server.api.schema import CredentialProxyConfig, NetworkPolicy, OSSFS, PlatformSpec, Volume
+    from opensandbox_server.api.schema import CredentialProxyConfig, NetworkPolicy, OSSFS, PlatformSpec, S3, Volume
     from opensandbox_server.config import EgressConfig, SecureRuntimeConfig
 
 logger = logging.getLogger(__name__)
@@ -59,6 +59,16 @@ DNS_SUBDOMAIN_RE = re.compile(rf"^(?:{DNS_LABEL_PATTERN}\.)*{DNS_LABEL_PATTERN}$
 LABEL_NAME_RE = re.compile(r"^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$")
 LABEL_VALUE_RE = re.compile(r"^([A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?)?$")
 HOST_PATH_RE = re.compile(r"^(/|[A-Za-z]:[\\/])")
+
+# S3 bucket naming rules: 3-63 chars, lowercase letters, digits, dots, hyphens,
+# starts and ends with a letter or digit, no consecutive dots.
+_S3_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+_S3_REGION_RE = re.compile(r"^[a-z]{2}(-[a-z]+)+-\d$")
+_S3_SHELL_META_RE = re.compile(r"[;&|`$()<>\n\r\s]")
+_S3_PREFIX_MAX_BYTES = 1024
+S3_RESERVED_MOUNT_OPTIONS: frozenset[str] = frozenset(
+    {"prefix", "region", "read-only", "allow-delete", "allow-overwrite"}
+)
 
 
 def _normalize_prefix_path(path: str) -> str:
@@ -573,6 +583,127 @@ def ensure_valid_ossfs_volume(ossfs: "OSSFS") -> None:
         )
 
 
+def s3_mount_option_name(option: str) -> str:
+    """Return the option name of a raw Mountpoint option ('uid=1000' -> 'uid', 'prefix a/' -> 'prefix')."""
+    return re.split(r"[= ]", option.strip(), maxsplit=1)[0]
+
+
+def ensure_valid_s3_mount_option(option: str) -> None:
+    """
+    Validate one raw Mountpoint mount option.
+
+    Rejects empty payloads, leading '-', shell metacharacters and the option
+    names the server owns (see ``S3_RESERVED_MOUNT_OPTIONS``).
+    """
+    if not isinstance(option, str) or not option.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": SandboxErrorCodes.INVALID_S3_OPTION,
+                "message": "S3 options must be non-empty strings.",
+            },
+        )
+    normalized = option.strip()
+    if normalized.startswith("-"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": SandboxErrorCodes.INVALID_S3_OPTION,
+                "message": (
+                    "S3 options must be raw option payloads without '-' prefix "
+                    "(e.g. 'uid=1000', 'allow-other')."
+                ),
+            },
+        )
+    if re.search(r"[;&|`$()<>\n\r]", normalized):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": SandboxErrorCodes.INVALID_S3_OPTION,
+                "message": f"S3 option '{normalized}' contains forbidden characters.",
+            },
+        )
+    name = s3_mount_option_name(normalized)
+    if name in S3_RESERVED_MOUNT_OPTIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": SandboxErrorCodes.INVALID_S3_OPTION,
+                "message": (
+                    f"S3 option '{name}' is reserved and set by the server. "
+                    f"Reserved options: {', '.join(sorted(S3_RESERVED_MOUNT_OPTIONS))}."
+                ),
+            },
+        )
+
+
+def ensure_valid_s3_volume(s3: "S3", allowed_buckets: Optional[List[str]] = None) -> None:
+    """
+    Validate S3 backend fields.
+
+    Args:
+        s3: S3 backend model.
+        allowed_buckets: Operator allowlist. Empty or None allows any bucket.
+
+    Raises:
+        HTTPException: When any S3 field is invalid.
+    """
+    bucket = s3.bucket.strip()
+    if not _S3_BUCKET_RE.match(bucket) or ".." in bucket:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": SandboxErrorCodes.INVALID_S3_BUCKET,
+                "message": (
+                    f"S3 bucket '{s3.bucket}' is not a valid bucket name "
+                    "(3-63 lowercase letters, digits, dots or hyphens; must start and end with a letter or digit)."
+                ),
+            },
+        )
+    if allowed_buckets and bucket not in allowed_buckets:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": SandboxErrorCodes.INVALID_S3_BUCKET,
+                "message": f"S3 bucket '{bucket}' is not in the server allowlist (storage.s3_allowed_buckets).",
+            },
+        )
+
+    if s3.prefix is not None and s3.prefix != "":
+        prefix = s3.prefix
+        if prefix.startswith("/"):
+            reason = "must be relative (no leading '/')"
+        elif any(part == ".." for part in prefix.split("/")):
+            reason = "must not contain '..' segments"
+        elif _S3_SHELL_META_RE.search(prefix):
+            reason = "contains forbidden characters or whitespace"
+        elif len(prefix.encode("utf-8")) > _S3_PREFIX_MAX_BYTES:
+            reason = f"exceeds {_S3_PREFIX_MAX_BYTES} bytes"
+        else:
+            reason = None
+        if reason is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_S3_PREFIX,
+                    "message": f"S3 prefix '{prefix}' {reason}.",
+                },
+            )
+
+    if s3.region is not None and not _S3_REGION_RE.match(s3.region):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": SandboxErrorCodes.INVALID_S3_REGION,
+                "message": f"S3 region '{s3.region}' is not a valid AWS region (e.g. 'eu-west-1').",
+            },
+        )
+
+    if s3.options is not None:
+        for option in s3.options:
+            ensure_valid_s3_mount_option(option)
+
+
 def ensure_egress_configured(
     network_policy: Optional["NetworkPolicy"],
     egress_config: Optional["EgressConfig"],
@@ -676,6 +807,7 @@ def ensure_egress_runtime_compatible(
 def ensure_volumes_valid(
     volumes: Optional[List["Volume"]],
     allowed_host_prefixes: Optional[List[str]] = None,
+    allowed_s3_buckets: Optional[List[str]] = None,
 ) -> None:
     """
     Validate a list of volume definitions.
@@ -690,6 +822,7 @@ def ensure_volumes_valid(
     Args:
         volumes: List of volumes to validate (optional).
         allowed_host_prefixes: Optional list of allowed host path prefixes.
+        allowed_s3_buckets: Optional allowlist of S3 buckets. Empty or None allows any bucket.
 
     Raises:
         HTTPException: When any validation fails.
@@ -716,7 +849,18 @@ def ensure_volumes_valid(
         # Validate mount path
         ensure_valid_mount_path(volume.mount_path)
 
-        # Validate subPath
+        # Validate subPath (s3 uses s3.prefix instead)
+        if volume.s3 is not None and volume.sub_path:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_SUB_PATH,
+                    "message": (
+                        f"Volume '{volume.name}': subPath is not supported for the s3 backend. "
+                        "Use s3.prefix to select a key prefix."
+                    ),
+                },
+            )
         ensure_valid_sub_path(volume.sub_path)
 
         # Count specified backends
@@ -724,6 +868,7 @@ def ensure_volumes_valid(
             volume.host is not None,
             volume.pvc is not None,
             volume.ossfs is not None,
+            volume.s3 is not None,
         ])
 
         if backends_specified == 0:
@@ -733,7 +878,7 @@ def ensure_volumes_valid(
                     "code": SandboxErrorCodes.INVALID_VOLUME_BACKEND,
                     "message": (
                         f"Volume '{volume.name}' must specify exactly one backend "
-                        "(host, pvc, ossfs), but none was provided."
+                        "(host, pvc, ossfs, s3), but none was provided."
                     ),
                 },
             )
@@ -745,7 +890,7 @@ def ensure_volumes_valid(
                     "code": SandboxErrorCodes.INVALID_VOLUME_BACKEND,
                     "message": (
                         f"Volume '{volume.name}' must specify exactly one backend "
-                        "(host, pvc, ossfs), but multiple were provided."
+                        "(host, pvc, ossfs, s3), but multiple were provided."
                     ),
                 },
             )
@@ -759,6 +904,9 @@ def ensure_volumes_valid(
 
         if volume.ossfs is not None:
             ensure_valid_ossfs_volume(volume.ossfs)
+
+        if volume.s3 is not None:
+            ensure_valid_s3_volume(volume.s3, allowed_s3_buckets)
 
 
 __all__ = [
@@ -775,5 +923,9 @@ __all__ = [
     "ensure_valid_host_path",
     "ensure_valid_pvc_name",
     "ensure_valid_ossfs_volume",
+    "ensure_valid_s3_volume",
+    "ensure_valid_s3_mount_option",
+    "s3_mount_option_name",
+    "S3_RESERVED_MOUNT_OPTIONS",
     "ensure_volumes_valid",
 ]

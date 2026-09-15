@@ -15,7 +15,7 @@
 import pytest
 from fastapi import HTTPException
 
-from opensandbox_server.api.schema import Host, OSSFS, PVC, Volume, PlatformSpec
+from opensandbox_server.api.schema import Host, OSSFS, PVC, S3, Volume, PlatformSpec
 from opensandbox_server.services.constants import SandboxErrorCodes
 from opensandbox_server.services.validators import (
     ensure_credential_proxy_configured,
@@ -26,6 +26,8 @@ from opensandbox_server.services.validators import (
     ensure_valid_host_path,
     ensure_valid_mount_path,
     ensure_valid_pvc_name,
+    ensure_valid_s3_mount_option,
+    ensure_valid_s3_volume,
     ensure_valid_sub_path,
     ensure_valid_volume_name,
     ensure_volumes_valid,
@@ -744,3 +746,85 @@ class TestEgressRuntimeCompatibility:
                 self._secure_runtime("gvisor"),
                 effective_runtime_class="kata-qemu",
             )
+
+
+class TestS3VolumeValidation:
+    def _volume(self, **s3_kwargs):
+        return Volume(
+            name="logs",
+            s3=S3(bucket=s3_kwargs.pop("bucket", "my-team-sandbox-logs"), **s3_kwargs),
+            mount_path="/mnt/logs",
+        )
+
+    def test_valid_s3_volume(self):
+        assert ensure_volumes_valid([self._volume(prefix="sandboxes/task-001", region="eu-west-1")]) is None
+
+    @pytest.mark.parametrize("bucket", ["UPPER-case", "has_underscore", "double..dot", "-leading", "trailing-"])
+    def test_invalid_bucket_name(self, bucket):
+        with pytest.raises(HTTPException) as exc:
+            ensure_volumes_valid([self._volume(bucket=bucket)])
+        assert exc.value.detail["code"] == SandboxErrorCodes.INVALID_S3_BUCKET
+
+    def test_bucket_not_in_allowlist(self):
+        with pytest.raises(HTTPException) as exc:
+            ensure_volumes_valid([self._volume()], allowed_s3_buckets=["other-bucket"])
+        assert exc.value.detail["code"] == SandboxErrorCodes.INVALID_S3_BUCKET
+
+    def test_bucket_in_allowlist_passes(self):
+        assert ensure_volumes_valid([self._volume()], allowed_s3_buckets=["my-team-sandbox-logs"]) is None
+
+    def test_empty_allowlist_allows_any_bucket(self):
+        assert ensure_volumes_valid([self._volume()], allowed_s3_buckets=[]) is None
+
+    @pytest.mark.parametrize("prefix", ["/absolute", "a/../b", "has space/", "semi;colon", "dollar$x"])
+    def test_invalid_prefix(self, prefix):
+        with pytest.raises(HTTPException) as exc:
+            ensure_volumes_valid([self._volume(prefix=prefix)])
+        assert exc.value.detail["code"] == SandboxErrorCodes.INVALID_S3_PREFIX
+
+    @pytest.mark.parametrize("region", ["EU-WEST-1", "eu-west", "us east 1", "eu-west-1;rm"])
+    def test_invalid_region(self, region):
+        with pytest.raises(HTTPException) as exc:
+            ensure_volumes_valid([self._volume(region=region)])
+        assert exc.value.detail["code"] == SandboxErrorCodes.INVALID_S3_REGION
+
+    @pytest.mark.parametrize("region", ["eu-west-1", "us-east-2", "ap-southeast-3", "us-gov-west-1"])
+    def test_valid_region(self, region):
+        assert ensure_volumes_valid([self._volume(region=region)]) is None
+
+    @pytest.mark.parametrize("option", ["--uid=1000", "-o allow-other", "uid=1000;id", "", "   "])
+    def test_invalid_option_payload(self, option):
+        with pytest.raises(HTTPException) as exc:
+            ensure_volumes_valid([self._volume(options=[option])])
+        assert exc.value.detail["code"] == SandboxErrorCodes.INVALID_S3_OPTION
+
+    @pytest.mark.parametrize(
+        "option",
+        ["prefix other/", "prefix=other/", "region us-east-1", "read-only", "allow-delete", "allow-overwrite"],
+    )
+    def test_reserved_option_rejected(self, option):
+        with pytest.raises(HTTPException) as exc:
+            ensure_volumes_valid([self._volume(options=[option])])
+        assert exc.value.detail["code"] == SandboxErrorCodes.INVALID_S3_OPTION
+        assert "reserved" in exc.value.detail["message"]
+
+    def test_allowed_options_pass(self):
+        assert ensure_volumes_valid([self._volume(options=["uid=1000", "gid=1000", "allow-other"])]) is None
+
+    def test_sub_path_rejected_for_s3(self):
+        volume = Volume(
+            name="logs",
+            s3=S3(bucket="my-team-sandbox-logs"),
+            mount_path="/mnt/logs",
+            sub_path="task-001",
+        )
+        with pytest.raises(HTTPException) as exc:
+            ensure_volumes_valid([volume])
+        assert exc.value.detail["code"] == SandboxErrorCodes.INVALID_SUB_PATH
+        assert "s3.prefix" in exc.value.detail["message"]
+
+    def test_ensure_valid_s3_mount_option_accepts_plain_flag(self):
+        assert ensure_valid_s3_mount_option("allow-other") is None
+
+    def test_ensure_valid_s3_volume_accepts_valid_model(self):
+        assert ensure_valid_s3_volume(S3(bucket="my-team-sandbox-logs", prefix="a/b")) is None
