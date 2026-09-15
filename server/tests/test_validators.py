@@ -828,3 +828,15 @@ class TestS3VolumeValidation:
 
     def test_ensure_valid_s3_volume_accepts_valid_model(self):
         assert ensure_valid_s3_volume(S3(bucket="my-team-sandbox-logs", prefix="a/b")) is None
+
+    @pytest.mark.parametrize(
+        "option",
+        ["uid=1000 allow-delete", "allow-other --prefix x", "PREFIX=other/", "prefix\tother/", "a b c"],
+    )
+    def test_smuggled_or_malformed_option_rejected(self, option):
+        with pytest.raises(HTTPException) as exc:
+            ensure_volumes_valid([self._volume(options=[option])])
+        assert exc.value.detail["code"] == SandboxErrorCodes.INVALID_S3_OPTION
+
+    def test_name_value_option_accepted(self):
+        assert ensure_valid_s3_mount_option("cache /tmp/mp-cache") is None

@@ -592,8 +592,11 @@ def ensure_valid_s3_mount_option(option: str) -> None:
     """
     Validate one raw Mountpoint mount option.
 
-    Rejects empty payloads, leading '-', shell metacharacters and the option
-    names the server owns (see ``S3_RESERVED_MOUNT_OPTIONS``).
+    Rejects empty payloads, tokens starting with '-', shell metacharacters,
+    malformed shapes (only 'name', 'name=value' or 'name value' are accepted)
+    and every token that names an option the server owns
+    (see ``S3_RESERVED_MOUNT_OPTIONS``). The CSI driver splits a mount option
+    entry on whitespace, so a reserved name in any position is rejected.
     """
     if not isinstance(option, str) or not option.strip():
         raise HTTPException(
@@ -604,7 +607,8 @@ def ensure_valid_s3_mount_option(option: str) -> None:
             },
         )
     normalized = option.strip()
-    if normalized.startswith("-"):
+    tokens = [token for token in re.split(r"[\s=]+", normalized) if token]
+    if any(token.startswith("-") for token in tokens):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
@@ -623,18 +627,29 @@ def ensure_valid_s3_mount_option(option: str) -> None:
                 "message": f"S3 option '{normalized}' contains forbidden characters.",
             },
         )
-    name = s3_mount_option_name(normalized)
-    if name in S3_RESERVED_MOUNT_OPTIONS:
+    if re.search(r"[^\S ]", normalized) or len(normalized.split(" ")) > 2:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "code": SandboxErrorCodes.INVALID_S3_OPTION,
                 "message": (
-                    f"S3 option '{name}' is reserved and set by the server. "
-                    f"Reserved options: {', '.join(sorted(S3_RESERVED_MOUNT_OPTIONS))}."
+                    f"S3 option '{normalized}' is malformed: "
+                    "must be 'name', 'name=value' or 'name value'."
                 ),
             },
         )
+    for token in tokens:
+        if token.lower() in S3_RESERVED_MOUNT_OPTIONS:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_S3_OPTION,
+                    "message": (
+                        f"S3 option '{token}' is reserved and set by the server. "
+                        f"Reserved options: {', '.join(sorted(S3_RESERVED_MOUNT_OPTIONS))}."
+                    ),
+                },
+            )
 
 
 def ensure_valid_s3_volume(s3: "S3", allowed_buckets: Optional[List[str]] = None) -> None:
