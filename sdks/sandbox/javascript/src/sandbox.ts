@@ -365,15 +365,15 @@ export class Sandbox {
     // Validate volumes before allocating transport resources.
     if (opts.volumes) {
       for (const vol of opts.volumes) {
-        const backendsSpecified = [vol.host, vol.pvc, vol.ossfs].filter((b) => b != null).length;
+        const backendsSpecified = [vol.host, vol.pvc, vol.ossfs, vol.s3].filter((b) => b != null).length;
         if (backendsSpecified === 0) {
           throw new Error(
-            `Volume '${vol.name}' must specify exactly one backend (host, pvc, ossfs), but none was provided.`
+            `Volume '${vol.name}' must specify exactly one backend (host, pvc, ossfs, s3), but none was provided.`
           );
         }
         if (backendsSpecified > 1) {
           throw new Error(
-            `Volume '${vol.name}' must specify exactly one backend (host, pvc, ossfs), but multiple were provided.`
+            `Volume '${vol.name}' must specify exactly one backend (host, pvc, ossfs, s3), but multiple were provided.`
           );
         }
         if (vol.host && !HOST_PATH_PATTERN.test(vol.host.path)) {

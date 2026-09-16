@@ -580,11 +580,67 @@ class OSSFS private constructor(
 }
 
 /**
+ * Amazon S3 mount backend. Kubernetes runtime only; credentials come from the
+ * IAM role bound to the CSI driver ServiceAccount.
+ *
+ * @property bucket S3 bucket name
+ * @property prefix Optional key prefix to mount (relative, no leading '/')
+ * @property region Optional AWS region, e.g. `eu-west-1`
+ * @property options Additional Mountpoint mount options without leading '-'
+ */
+class S3 private constructor(
+    val bucket: String,
+    val prefix: String?,
+    val region: String?,
+    val options: List<String>?,
+) {
+    companion object {
+        @JvmStatic
+        fun builder(): Builder = Builder()
+    }
+
+    class Builder {
+        private var bucket: String? = null
+        private var prefix: String? = null
+        private var region: String? = null
+        private var options: List<String>? = null
+
+        fun bucket(bucket: String): Builder {
+            require(bucket.isNotBlank()) { "S3 bucket cannot be blank" }
+            this.bucket = bucket
+            return this
+        }
+
+        fun prefix(prefix: String): Builder {
+            this.prefix = prefix
+            return this
+        }
+
+        fun region(region: String): Builder {
+            this.region = region
+            return this
+        }
+
+        fun options(options: List<String>): Builder {
+            this.options = options
+            return this
+        }
+
+        fun options(vararg options: String): Builder = options(options.toList())
+
+        fun build(): S3 {
+            val bucketValue = bucket ?: throw IllegalArgumentException("S3 bucket must be specified")
+            return S3(bucket = bucketValue, prefix = prefix, region = region, options = options)
+        }
+    }
+}
+
+/**
  * Storage mount definition for a sandbox.
  *
  * Each volume entry contains:
  * - A unique name identifier
- * - Exactly one backend (host, pvc, ossfs) with backend-specific fields
+ * - Exactly one backend (host, pvc, ossfs, s3) with backend-specific fields
  * - Common mount settings (mountPath, readOnly, subPath)
  *
  * Example usage:
@@ -606,9 +662,10 @@ class OSSFS private constructor(
  * ```
  *
  * @property name Unique identifier for the volume within the sandbox
- * @property host Host path bind mount backend (mutually exclusive with pvc/ossfs)
- * @property pvc Kubernetes PVC mount backend (mutually exclusive with host/ossfs)
- * @property ossfs OSSFS mount backend (mutually exclusive with host/pvc)
+ * @property host Host path bind mount backend (mutually exclusive with pvc/ossfs/s3)
+ * @property pvc Kubernetes PVC mount backend (mutually exclusive with host/ossfs/s3)
+ * @property ossfs OSSFS mount backend (mutually exclusive with host/pvc/s3)
+ * @property s3 Amazon S3 mount backend (mutually exclusive with host/pvc/ossfs)
  * @property mountPath Absolute path inside the container where the volume is mounted
  * @property readOnly If true, the volume is mounted as read-only. Defaults to false (read-write).
  * @property subPath Optional subdirectory under the backend path to mount
@@ -618,6 +675,7 @@ class Volume private constructor(
     val host: Host?,
     val pvc: PVC?,
     val ossfs: OSSFS?,
+    val s3: S3?,
     val mountPath: String,
     val readOnly: Boolean,
     val subPath: String?,
@@ -632,6 +690,7 @@ class Volume private constructor(
         private var host: Host? = null
         private var pvc: PVC? = null
         private var ossfs: OSSFS? = null
+        private var s3: S3? = null
         private var mountPath: String? = null
         private var readOnly: Boolean = false
         private var subPath: String? = null
@@ -657,6 +716,11 @@ class Volume private constructor(
             return this
         }
 
+        fun s3(s3: S3): Builder {
+            this.s3 = s3
+            return this
+        }
+
         fun mountPath(mountPath: String): Builder {
             require(mountPath.startsWith("/")) { "Mount path must be an absolute path starting with '/'" }
             this.mountPath = mountPath
@@ -678,15 +742,15 @@ class Volume private constructor(
             val mountPathValue = mountPath ?: throw IllegalArgumentException("Mount path must be specified")
 
             // Validate exactly one backend is specified
-            val backendsSpecified = listOfNotNull(host, pvc, ossfs).size
+            val backendsSpecified = listOfNotNull(host, pvc, ossfs, s3).size
             if (backendsSpecified == 0) {
                 throw IllegalArgumentException(
-                    "Exactly one backend (host, pvc, ossfs) must be specified, but none was provided",
+                    "Exactly one backend (host, pvc, ossfs, s3) must be specified, but none was provided",
                 )
             }
             if (backendsSpecified > 1) {
                 throw IllegalArgumentException(
-                    "Exactly one backend (host, pvc, ossfs) must be specified, but multiple were provided",
+                    "Exactly one backend (host, pvc, ossfs, s3) must be specified, but multiple were provided",
                 )
             }
 
@@ -695,6 +759,7 @@ class Volume private constructor(
                 host = host,
                 pvc = pvc,
                 ossfs = ossfs,
+                s3 = s3,
                 mountPath = mountPathValue,
                 readOnly = readOnly,
                 subPath = subPath,

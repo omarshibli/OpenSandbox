@@ -63,6 +63,7 @@ Persistent and shared storage patterns for sandboxes.
 | [Docker PVC Volume](/examples/docker-pvc-volume-mount) | Docker named volume mounts |
 | [Docker OSSFS Volume](/examples/docker-ossfs-volume-mount) | Docker OSSFS (OSS FUSE) mounts |
 | [Kubernetes PVC](/examples/kubernetes-pvc-volume-mount) | Kubernetes PersistentVolumeClaim mounts |
+| [Kubernetes S3](/examples/kubernetes-s3-volume-mount) | Amazon S3 mounts on EKS with no access keys |
 
 ## How to Run
 

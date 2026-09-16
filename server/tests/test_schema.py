@@ -30,6 +30,7 @@ from opensandbox_server.api.schema import (
     PlatformSpec,
     PVC,
     ResourceLimits,
+    S3,
     SandboxLifecycle,
     Snapshot,
     SnapshotFilter,
@@ -846,3 +847,67 @@ class TestCreateSandboxRequestPoolMode:
             CreateSandboxRequest(
                 extensions={"poolRef": "   "},
             )
+
+
+class TestS3Backend:
+    def test_valid_s3_minimal(self):
+        backend = S3(bucket="my-team-sandbox-logs")
+        assert backend.bucket == "my-team-sandbox-logs"
+        assert backend.prefix is None
+        assert backend.region is None
+        assert backend.options is None
+
+    def test_valid_s3_full(self):
+        backend = S3(
+            bucket="my-team-sandbox-logs",
+            prefix="sandboxes/task-001/",
+            region="eu-west-1",
+            options=["uid=1000", "gid=1000"],
+        )
+        assert backend.prefix == "sandboxes/task-001/"
+        assert backend.region == "eu-west-1"
+        assert backend.options == ["uid=1000", "gid=1000"]
+
+    def test_s3_rejects_unknown_field(self):
+        with pytest.raises(ValidationError):
+            S3(bucket="my-team-sandbox-logs", accessKeyId="AKIA")  # type: ignore[call-arg]
+
+    def test_s3_bucket_length_bounds(self):
+        with pytest.raises(ValidationError):
+            S3(bucket="ab")
+        with pytest.raises(ValidationError):
+            S3(bucket="a" * 64)
+
+    def test_volume_with_s3_backend(self):
+        volume = Volume(
+            name="logs",
+            s3=S3(bucket="my-team-sandbox-logs", prefix="sandboxes/task-001/"),
+            mount_path="/mnt/logs",
+        )
+        assert volume.s3 is not None
+        assert volume.s3.bucket == "my-team-sandbox-logs"
+        assert volume.host is None and volume.pvc is None and volume.ossfs is None
+
+    def test_volume_s3_plus_pvc_rejected(self):
+        with pytest.raises(ValidationError, match="multiple"):
+            Volume(
+                name="logs",
+                s3=S3(bucket="my-team-sandbox-logs"),
+                pvc=PVC(claim_name="claim"),
+                mount_path="/mnt/logs",
+            )
+
+    def test_serialization_s3_volume(self):
+        volume = Volume(
+            name="logs",
+            s3=S3(bucket="my-team-sandbox-logs", region="eu-west-1"),
+            mount_path="/mnt/logs",
+            read_only=True,
+        )
+        dumped = volume.model_dump(by_alias=True, exclude_none=True)
+        assert dumped == {
+            "name": "logs",
+            "s3": {"bucket": "my-team-sandbox-logs", "region": "eu-west-1"},
+            "mountPath": "/mnt/logs",
+            "readOnly": True,
+        }

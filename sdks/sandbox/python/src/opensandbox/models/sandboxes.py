@@ -542,13 +542,31 @@ class OSSFS(BaseModel):
         return self
 
 
+class S3(BaseModel):
+    """Amazon S3 mount backend (Kubernetes runtime only, credentials from the cluster IAM role)."""
+
+    bucket: str = Field(description="S3 bucket name.")
+    prefix: str | None = Field(
+        default=None,
+        description="Optional key prefix to mount, relative, no leading '/'.",
+    )
+    region: str | None = Field(
+        default=None, description="Optional AWS region, e.g. 'eu-west-1'."
+    )
+    options: list[str] | None = Field(
+        default=None,
+        description="Additional Mountpoint mount options without leading '-'.",
+    )
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class Volume(BaseModel):
     """
     Storage mount definition for a sandbox.
 
     Each volume entry contains:
     - A unique name identifier
-    - Exactly one backend (host, pvc, ossfs) with backend-specific fields
+    - Exactly one backend (host, pvc, ossfs, s3) with backend-specific fields
     - Common mount settings (mount_path, read_only, sub_path)
 
     Usage:
@@ -583,6 +601,10 @@ class Volume(BaseModel):
         default=None,
         description="OSSFS mount backend.",
     )
+    s3: S3 | None = Field(
+        default=None,
+        description="Amazon S3 mount backend (Kubernetes runtime only).",
+    )
     mount_path: str = Field(
         description="Absolute path inside the container where the volume is mounted.",
         alias="mountPath",
@@ -616,16 +638,16 @@ class Volume(BaseModel):
 
     @model_validator(mode="after")
     def validate_exactly_one_backend(self) -> "Volume":
-        """Ensure exactly one backend (host, pvc, or ossfs) is specified."""
-        backends = [self.host, self.pvc, self.ossfs]
+        """Ensure exactly one backend (host, pvc, ossfs, or s3) is specified."""
+        backends = [self.host, self.pvc, self.ossfs, self.s3]
         specified = [b for b in backends if b is not None]
         if len(specified) == 0:
             raise ValueError(
-                "Exactly one backend (host, pvc, ossfs) must be specified, but none was provided."
+                "Exactly one backend (host, pvc, ossfs, s3) must be specified, but none was provided."
             )
         if len(specified) > 1:
             raise ValueError(
-                "Exactly one backend (host, pvc, ossfs) must be specified, but multiple were provided."
+                "Exactly one backend (host, pvc, ossfs, s3) must be specified, but multiple were provided."
             )
         return self
 

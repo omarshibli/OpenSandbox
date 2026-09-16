@@ -801,6 +801,53 @@ class StorageConfig(BaseModel):
             "'ossfs_mount_root/<bucket>/<volume.subPath?>'."
         ),
     )
+    s3_csi_driver: str = Field(
+        default="s3.csi.aws.com",
+        description=(
+            "Name of the CSIDriver object used for s3 volumes (Mountpoint for Amazon S3 CSI driver). "
+            "The server checks that it exists before creating s3 volumes."
+        ),
+    )
+    s3_mount_options: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Operator-provided Mountpoint mount options added to every s3 volume "
+            "(e.g. 'uid=1000'). Raw payloads without leading '-'. Server-owned options "
+            "(prefix, region, read-only, allow-delete, allow-overwrite) are rejected."
+        ),
+    )
+    s3_allowed_buckets: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Allowlist of S3 bucket names permitted for s3 volumes. "
+            "If empty, any bucket is allowed; the IAM role bound to the CSI driver is the boundary."
+        ),
+    )
+
+    s3_orphan_sweep_interval_seconds: int = Field(
+        default=900,
+        ge=0,
+        description=(
+            "Interval in seconds between background sweeps that delete server-managed s3 "
+            "PersistentVolumes whose PersistentVolumeClaim is gone (for example after a TTL "
+            "expiry removed the claim through ownerReferences). 0 disables the periodic sweep; "
+            "the startup sweep always runs."
+        ),
+    )
+
+    @field_validator("s3_mount_options")
+    @classmethod
+    def _validate_s3_mount_options(cls, options: list[str]) -> list[str]:
+        # Same checks as request options so an operator entry can never be
+        # weaker than a caller entry. Imported here because the services
+        # package imports this module at import time.
+        from opensandbox_server.services.constants import s3_mount_option_error
+
+        for option in options:
+            reason = s3_mount_option_error(option)
+            if reason is not None:
+                raise ValueError(f"storage.s3_mount_options entry '{option}': {reason}")
+        return options
 
 DEFAULT_EGRESS_DISABLE_IPV6 = True
 

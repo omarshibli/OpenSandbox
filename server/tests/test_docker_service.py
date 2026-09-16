@@ -79,6 +79,7 @@ from opensandbox_server.api.schema import (
     PVC,
     ResourceLimits,
     RenewSandboxExpirationRequest,
+    S3,
     SandboxLifecycle,
     Volume,
 )
@@ -3828,6 +3829,38 @@ class TestDockerVolumeValidation:
 
         assert exc_info.value.status_code == status.HTTP_400_BAD_REQUEST
         assert exc_info.value.detail["code"] == SandboxErrorCodes.HOST_PATH_NOT_ALLOWED
+
+    @pytest.mark.asyncio
+    async def test_s3_volume_unsupported_on_docker(self, mock_docker):
+        """The s3 backend is Kubernetes-only; Docker must reject it before any side effect."""
+        mock_client = MagicMock()
+        mock_client.containers.list.return_value = []
+        mock_docker.from_env.return_value = mock_client
+
+        service = DockerSandboxService(config=_app_config())
+
+        request = CreateSandboxRequest(
+            image=ImageSpec(uri="python:3.11"),
+            timeout=120,
+            resourceLimits=ResourceLimits(root={}),
+            env={},
+            metadata={},
+            entrypoint=["python"],
+            volumes=[
+                Volume(
+                    name="logs",
+                    s3=S3(bucket="my-team-sandbox-logs"),
+                    mount_path="/mnt/logs",
+                )
+            ],
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            await service.create_sandbox(request)
+
+        assert exc_info.value.status_code == status.HTTP_400_BAD_REQUEST
+        assert exc_info.value.detail["code"] == SandboxErrorCodes.UNSUPPORTED_VOLUME_BACKEND
+        mock_client.api.create_container.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_volumes_passes_validation(self, mock_docker):

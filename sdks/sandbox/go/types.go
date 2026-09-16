@@ -99,6 +99,7 @@ type Volume struct {
 	Host      *Host  `json:"host,omitempty"`
 	PVC       *PVC   `json:"pvc,omitempty"`
 	OSSFS     *OSSFS `json:"ossfs,omitempty"`
+	S3        *S3    `json:"s3,omitempty"`
 	MountPath string `json:"mountPath"`
 	ReadOnly  bool   `json:"readOnly,omitempty"`
 	SubPath   string `json:"subPath,omitempty"`
@@ -127,6 +128,15 @@ type OSSFS struct {
 	Options         []string `json:"options,omitempty"`
 	AccessKeyID     string   `json:"accessKeyId"`
 	AccessKeySecret string   `json:"accessKeySecret"`
+}
+
+// S3 represents an Amazon S3 mount backend (Kubernetes runtime only).
+// Credentials come from the IAM role bound to the CSI driver; none are sent.
+type S3 struct {
+	Bucket  string   `json:"bucket"`
+	Prefix  string   `json:"prefix,omitempty"`
+	Region  string   `json:"region,omitempty"`
+	Options []string `json:"options,omitempty"`
 }
 
 // NetworkPolicy defines the egress network policy for a sandbox.

@@ -245,6 +245,7 @@ coverage/
 
 # Kotlin
 *.kotlin_module
+.kotlin/
 
 # JetBrains specific
 .idea/

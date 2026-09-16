@@ -268,7 +268,7 @@ class BatchSandboxProvider(WorkloadProvider):
         )
 
         if volumes:
-            apply_volumes_to_pod_spec(pod_spec, volumes)
+            apply_volumes_to_pod_spec(pod_spec, volumes, sandbox_id=sandbox_id)
 
         spec: Dict[str, Any] = {
             "replicas": 1,

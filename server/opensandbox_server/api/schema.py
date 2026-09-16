@@ -355,13 +355,55 @@ class OSSFS(BaseModel):
         return self
 
 
+class S3(BaseModel):
+    """
+    Amazon S3 mount backend.
+
+    Kubernetes runtime only. The server creates a static PersistentVolume for
+    the Mountpoint for Amazon S3 CSI driver and a bound PersistentVolumeClaim,
+    then mounts the claim into the sandbox. Credentials come from the IAM role
+    bound to the CSI driver ServiceAccount; the request carries none.
+    """
+
+    bucket: str = Field(
+        ...,
+        description="S3 bucket name.",
+        min_length=3,
+        max_length=63,
+    )
+    prefix: Optional[str] = Field(
+        None,
+        description=(
+            "Optional key prefix inside the bucket to mount. "
+            "Relative, no leading '/'. The server appends a trailing '/' if absent."
+        ),
+        max_length=1024,
+    )
+    region: Optional[str] = Field(
+        None,
+        description="Optional AWS region of the bucket, e.g. 'eu-west-1'. Detected by Mountpoint when absent.",
+    )
+    options: Optional[List[str]] = Field(
+        None,
+        description=(
+            "Additional Mountpoint mount options as raw payloads without leading '-', "
+            "e.g. 'uid=1000'. Server-owned options (prefix, region, read-only, "
+            "allow-delete, allow-overwrite) are rejected."
+        ),
+    )
+
+    class Config:
+        populate_by_name = True
+        extra = "forbid"
+
+
 class Volume(BaseModel):
     """
     Storage mount definition for a sandbox.
 
     Each volume entry contains:
     - A unique name identifier
-    - Exactly one backend struct (host, pvc, etc.) with backend-specific fields
+    - Exactly one backend struct (host, pvc, ossfs, s3) with backend-specific fields
     - Common mount settings (mountPath, readOnly, subPath)
     """
 
@@ -382,6 +424,10 @@ class Volume(BaseModel):
     ossfs: Optional[OSSFS] = Field(
         None,
         description="OSSFS mount backend.",
+    )
+    s3: Optional[S3] = Field(
+        None,
+        description="Amazon S3 mount backend (Kubernetes runtime only).",
     )
     mount_path: str = Field(
         ...,
@@ -406,12 +452,12 @@ class Volume(BaseModel):
     @model_validator(mode="after")
     def validate_exactly_one_backend(self) -> "Volume":
         """Ensure exactly one backend type is specified."""
-        backends = [self.host, self.pvc, self.ossfs]
+        backends = [self.host, self.pvc, self.ossfs, self.s3]
         specified = [b for b in backends if b is not None]
         if len(specified) == 0:
-            raise ValueError("Exactly one backend (host, pvc, ossfs) must be specified, but none was provided.")
+            raise ValueError("Exactly one backend (host, pvc, ossfs, s3) must be specified, but none was provided.")
         if len(specified) > 1:
-            raise ValueError("Exactly one backend (host, pvc, ossfs) must be specified, but multiple were provided.")
+            raise ValueError("Exactly one backend (host, pvc, ossfs, s3) must be specified, but multiple were provided.")
         return self
 
 

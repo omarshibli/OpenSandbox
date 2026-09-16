@@ -283,15 +283,19 @@ See [`components/egress/README.md`](../components/egress/README.md) for sidecar 
 
 ## `[storage]`
 
-Host-side storage related to **volume mounts** (host bind allowlist and OSSFS mount layout).
+Host-side storage related to **volume mounts** (host bind allowlist, OSSFS mount layout, and S3 mounts).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `allowed_host_paths` | list of strings | `[]` | Absolute path **prefixes** allowed for **host** bind mounts. If **empty**, all host bind mounts are rejected (secure-by-default). |
 | `ossfs_mount_root` | string | `"/mnt/ossfs"` | Host directory under which OSSFS-backed mounts are resolved (`<root>/<bucket>/...`). |
 | `volume_default_size` | string | `"1Gi"` | Default storage size for auto-created Kubernetes PVCs when the caller does not specify a size in the PVC provisioning hints. |
+| `s3_csi_driver` | string | `"s3.csi.aws.com"` | Name of the `CSIDriver` object used for **s3** volumes (Mountpoint for Amazon S3 CSI driver). Checked before the server creates s3 volumes. |
+| `s3_mount_options` | list of strings | `[]` | Operator Mountpoint options added to every s3 volume (e.g. `uid=1000`). Raw payloads without leading `-`; server-owned options are rejected. |
+| `s3_allowed_buckets` | list of strings | `[]` | Allowlist of S3 buckets for s3 volumes. Empty means any bucket; the IAM role is the boundary. |
+| `s3_orphan_sweep_interval_seconds` | integer | `900` | Period (seconds) of the background sweep that deletes server-managed s3 PersistentVolumes whose PersistentVolumeClaim is gone — for example after a TTL expiry removed the claim through `ownerReferences`. `0` disables the periodic sweep; the startup sweep always runs. |
 
-Sandbox **volume** models (`host`, `pvc`, `ossfs`) in API requests are documented in the OpenAPI specs and OSEPs; this table only covers **server** storage settings.
+Sandbox **volume** models (`host`, `pvc`, `ossfs`, `s3`) in API requests are documented in the OpenAPI specs and OSEPs; this table only covers **server** storage settings.
 
 ---
 

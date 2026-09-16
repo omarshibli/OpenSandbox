@@ -14,6 +14,9 @@
 
 """Shared constants for sandbox services."""
 
+import re
+from typing import Optional
+
 from opensandbox_server.constants import OPENSANDBOX_LIFECYCLE
 
 RESERVED_LABEL_PREFIX = "opensandbox.io/"
@@ -157,6 +160,10 @@ class SandboxErrorCodes:
     OSSFS_PATH_NOT_FOUND = "VOLUME::OSSFS_PATH_NOT_FOUND"
     OSSFS_MOUNT_FAILED = "VOLUME::OSSFS_MOUNT_FAILED"
     OSSFS_UNMOUNT_FAILED = "VOLUME::OSSFS_UNMOUNT_FAILED"
+    INVALID_S3_BUCKET = "VOLUME::INVALID_S3_BUCKET"
+    INVALID_S3_PREFIX = "VOLUME::INVALID_S3_PREFIX"
+    INVALID_S3_REGION = "VOLUME::INVALID_S3_REGION"
+    INVALID_S3_OPTION = "VOLUME::INVALID_S3_OPTION"
 
     # Pause/Resume error codes
     INVALID_STATE = "KUBERNETES::INVALID_STATE"
@@ -168,6 +175,48 @@ class SnapshotErrorCodes:
     INVALID_SOURCE_STATE = "SNAPSHOT::INVALID_SOURCE_STATE"
     RUNTIME_PREFLIGHT_FAILED = "SNAPSHOT::RUNTIME_PREFLIGHT_FAILED"
     UNSUPPORTED_RUNTIME = "SNAPSHOT::UNSUPPORTED_RUNTIME"
+
+
+# -- s3 mount options ------------------------------------------------------
+
+# Options the server owns and sets itself from the volume model. Rejected in
+# request ``s3.options`` and in operator ``storage.s3_mount_options`` alike.
+S3_RESERVED_MOUNT_OPTIONS: frozenset[str] = frozenset(
+    {"prefix", "region", "read-only", "allow-delete", "allow-overwrite"}
+)
+# A raw Mountpoint option never needs a shell metacharacter or a comma; the
+# CSI driver passes the entry through to the mount helper.
+_S3_OPTION_FORBIDDEN_RE = re.compile(r"[;&|`$()<>,\n\r]")
+# The CSI driver splits an entry on whitespace and '='; a comma would smuggle
+# a second option into one entry, so it separates tokens here too.
+_S3_OPTION_TOKEN_RE = re.compile(r"[\s=,]+")
+
+
+def s3_mount_option_error(option: str) -> Optional[str]:
+    """Return a human-readable reason when a raw Mountpoint option is not acceptable, else None."""
+    if not isinstance(option, str) or not option.strip():
+        return "S3 options must be non-empty strings."
+    normalized = option.strip()
+    tokens = [token for token in _S3_OPTION_TOKEN_RE.split(normalized) if token]
+    if any(token.startswith("-") for token in tokens):
+        return (
+            "S3 options must be raw option payloads without '-' prefix "
+            "(e.g. 'uid=1000', 'allow-other')."
+        )
+    if _S3_OPTION_FORBIDDEN_RE.search(normalized):
+        return f"S3 option '{normalized}' contains forbidden characters."
+    if re.search(r"[^\S ]", normalized) or len(normalized.split(" ")) > 2:
+        return (
+            f"S3 option '{normalized}' is malformed: "
+            "must be 'name', 'name=value' or 'name value'."
+        )
+    for token in tokens:
+        if token.lower() in S3_RESERVED_MOUNT_OPTIONS:
+            return (
+                f"S3 option '{token}' is reserved and set by the server. "
+                f"Reserved options: {', '.join(sorted(S3_RESERVED_MOUNT_OPTIONS))}."
+            )
+    return None
 
 
 __all__ = [
@@ -201,4 +250,6 @@ __all__ = [
     "OPENSANDBOX_LIFECYCLE",
     "SandboxErrorCodes",
     "SnapshotErrorCodes",
+    "S3_RESERVED_MOUNT_OPTIONS",
+    "s3_mount_option_error",
 ]

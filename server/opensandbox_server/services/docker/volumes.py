@@ -69,7 +69,11 @@ class DockerVolumesMixin:
             return {}, []
 
         allowed_prefixes = self.app_config.storage.allowed_host_paths
-        ensure_volumes_valid(request.volumes, allowed_host_prefixes=allowed_prefixes)
+        ensure_volumes_valid(
+            request.volumes,
+            allowed_host_prefixes=allowed_prefixes,
+            allowed_s3_buckets=self.app_config.storage.s3_allowed_buckets,
+        )
 
         pvc_inspect_cache: dict[str, dict] = {}
         auto_created_volumes: list[str] = []
@@ -84,6 +88,17 @@ class DockerVolumesMixin:
                         auto_created_volumes.append(volume.pvc.claim_name)
                 elif volume.ossfs is not None:
                     self._validate_ossfs_volume(volume)
+                elif volume.s3 is not None:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail={
+                            "code": SandboxErrorCodes.UNSUPPORTED_VOLUME_BACKEND,
+                            "message": (
+                                f"Volume '{volume.name}': the s3 backend is supported only on the "
+                                "Kubernetes runtime."
+                            ),
+                        },
+                    )
         except Exception:
             # If any subsequent volume validation fails, remove volumes we
             # already auto-created so they don't leak — delete_sandbox will

@@ -25,6 +25,8 @@ from opensandbox_server.api.schema import (
     NetworkPolicy,
     NetworkRule,
     PlatformSpec,
+    S3,
+    Volume,
 )
 from opensandbox_server.config import (
     AppConfig,
@@ -3127,6 +3129,90 @@ spec:
                 extensions={"poolRef": "my-pool"},
                 volumes=volumes,
             )
+
+    def test_apply_volumes_to_pod_spec_s3_volume(self, mock_k8s_client):
+        pod_spec = {"containers": [{"name": "main", "volumeMounts": []}], "volumes": []}
+        volumes = [
+            Volume(
+                name="logs",
+                s3=S3(bucket="my-team-sandbox-logs", prefix="p/"),
+                mount_path="/mnt/logs",
+            )
+        ]
+
+        apply_volumes_to_pod_spec(pod_spec, volumes, sandbox_id="abc123")
+
+        assert pod_spec["volumes"] == [
+            {"name": "logs", "persistentVolumeClaim": {"claimName": "s3-abc123-logs", "readOnly": False}}
+        ]
+        assert pod_spec["containers"][0]["volumeMounts"] == [
+            {"name": "logs", "mountPath": "/mnt/logs", "readOnly": False}
+        ]
+
+    def test_apply_volumes_to_pod_spec_s3_read_only(self, mock_k8s_client):
+        pod_spec = {"containers": [{"name": "main", "volumeMounts": []}], "volumes": []}
+        volumes = [
+            Volume(name="data", s3=S3(bucket="datasets"), mount_path="/mnt/data", read_only=True)
+        ]
+
+        apply_volumes_to_pod_spec(pod_spec, volumes, sandbox_id="abc123")
+
+        assert pod_spec["volumes"][0]["persistentVolumeClaim"] == {
+            "claimName": "s3-abc123-data",
+            "readOnly": True,
+        }
+        assert pod_spec["containers"][0]["volumeMounts"][0]["readOnly"] is True
+        assert "subPath" not in pod_spec["containers"][0]["volumeMounts"][0]
+
+    def test_apply_volumes_to_pod_spec_two_s3_volumes(self, mock_k8s_client):
+        pod_spec = {"containers": [{"name": "main", "volumeMounts": []}], "volumes": []}
+        volumes = [
+            Volume(name="logs", s3=S3(bucket="bucket-one"), mount_path="/mnt/logs"),
+            Volume(name="data", s3=S3(bucket="bucket-two"), mount_path="/mnt/data"),
+        ]
+
+        apply_volumes_to_pod_spec(pod_spec, volumes, sandbox_id="abc123")
+
+        assert [v["persistentVolumeClaim"]["claimName"] for v in pod_spec["volumes"]] == [
+            "s3-abc123-logs",
+            "s3-abc123-data",
+        ]
+
+    def test_apply_volumes_to_pod_spec_s3_requires_sandbox_id(self, mock_k8s_client):
+        pod_spec = {"containers": [{"name": "main", "volumeMounts": []}], "volumes": []}
+        volumes = [Volume(name="logs", s3=S3(bucket="bucket-one"), mount_path="/mnt/logs")]
+
+        with pytest.raises(ValueError, match="sandbox_id"):
+            apply_volumes_to_pod_spec(pod_spec, volumes)
+
+    def test_create_workload_with_s3_volume_mounts_generated_claim(self, mock_k8s_client):
+        provider = BatchSandboxProvider(mock_k8s_client)
+        mock_k8s_client.create_custom_object.return_value = {
+            "metadata": {"name": "test-id", "uid": "test-uid"}
+        }
+        expires_at = datetime(2025, 12, 31, 10, 0, 0, tzinfo=timezone.utc)
+
+        provider.create_workload(
+            sandbox_id="test-id",
+            namespace="test-ns",
+            image_spec=ImageSpec(uri="python:3.11"),
+            entrypoint=["/bin/bash"],
+            env={},
+            resource_limits={},
+            labels={},
+            expires_at=expires_at,
+            execd_image="execd:latest",
+            volumes=[Volume(name="logs", s3=S3(bucket="bucket-one"), mount_path="/mnt/logs")],
+        )
+
+        body = mock_k8s_client.create_custom_object.call_args.kwargs["body"]
+        pod_spec = body["spec"]["template"]["spec"]
+        claims = [
+            v["persistentVolumeClaim"]["claimName"]
+            for v in pod_spec["volumes"]
+            if "persistentVolumeClaim" in v
+        ]
+        assert "s3-test-id-logs" in claims
 
     def test_apply_volumes_to_pod_spec_empty_volumes(self, mock_k8s_client):
         pod_spec = {

@@ -52,6 +52,7 @@ from opensandbox.models.filesystem import (
 from opensandbox.models.sandboxes import (
     OSSFS,
     PVC,
+    S3,
     Host,
     SandboxAllocation,
     SandboxFilter,
@@ -614,3 +615,22 @@ def test_isolated_capabilities_parse_mode_availability() -> None:
 
     assert capabilities.setpriv_available is False
     assert capabilities.userns_available is True
+
+
+def test_s3_backend_minimal() -> None:
+    backend = S3(bucket="my-team-sandbox-logs")
+    assert backend.bucket == "my-team-sandbox-logs"
+    assert backend.prefix is None
+    assert backend.region is None
+    assert backend.options is None
+
+
+def test_volume_with_s3_backend() -> None:
+    vol = Volume(name="logs", s3=S3(bucket="b", prefix="p/"), mountPath="/mnt/logs")
+    assert vol.s3 is not None and vol.s3.prefix == "p/"
+    assert vol.host is None and vol.pvc is None and vol.ossfs is None
+
+
+def test_volume_rejects_s3_with_pvc() -> None:
+    with pytest.raises(ValueError, match="multiple"):
+        Volume(name="x", s3=S3(bucket="b"), pvc=PVC(claimName="c"), mountPath="/x")

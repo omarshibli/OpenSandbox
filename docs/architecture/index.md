@@ -280,8 +280,9 @@ The lifecycle API exposes runtime-neutral volume models:
 - `host`: bind a permitted host path.
 - `pvc`: platform-managed named storage. Docker maps this to a Docker named volume; Kubernetes maps it to a PersistentVolumeClaim.
 - `ossfs`: mount Alibaba Cloud OSS through the server/runtime integration.
+- `s3`: mount an Amazon S3 bucket prefix through the Mountpoint for Amazon S3 CSI driver (Kubernetes runtime only, no access keys).
 
-Runtime providers validate and materialize these volume definitions differently, but the API shape stays shared. Volume mounts are supported for Docker and Kubernetes container workloads; the FastSandbox adapter currently rejects volume mounts.
+Runtime providers validate and materialize these volume definitions differently, but the API shape stays shared. Backend support by runtime: Docker supports `host`, `pvc` and `ossfs`; Kubernetes supports `host`, `pvc` and `s3`. The FastSandbox adapter rejects volume mounts.
 
 ### 5.4 Egress Sidecar
 

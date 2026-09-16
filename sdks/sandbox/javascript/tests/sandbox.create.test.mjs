@@ -353,6 +353,46 @@ test("Sandbox.create passes OSSFS volume to request", async () => {
   assert.equal(recordedRequests[0].volumes[0].ossfs.endpoint, "oss-cn-hangzhou.aliyuncs.com");
 });
 
+test("Sandbox.create passes S3 volume to request", async () => {
+  const { adapterFactory, recordedRequests } = createAdapterFactory();
+
+  await Sandbox.create({
+    adapterFactory,
+    connectionConfig: { domain: "http://127.0.0.1:8080" },
+    image: "python:3.12",
+    skipHealthCheck: true,
+    volumes: [
+      {
+        name: "logs",
+        s3: { bucket: "my-team-sandbox-logs", prefix: "sandboxes/task-001/", region: "eu-west-1" },
+        mountPath: "/mnt/logs",
+      },
+    ],
+  });
+
+  assert.equal(recordedRequests.length, 1);
+  assert.equal(recordedRequests[0].volumes[0].s3.bucket, "my-team-sandbox-logs");
+  assert.equal(recordedRequests[0].volumes[0].s3.prefix, "sandboxes/task-001/");
+  assert.equal(recordedRequests[0].volumes[0].ossfs, undefined);
+});
+
+test("Sandbox.create rejects volume with s3 and pvc", async () => {
+  const { adapterFactory } = createAdapterFactory();
+
+  await assert.rejects(
+    Sandbox.create({
+      adapterFactory,
+      connectionConfig: { domain: "http://127.0.0.1:8080" },
+      image: "python:3.12",
+      skipHealthCheck: true,
+      volumes: [
+        { name: "x", s3: { bucket: "b" }, pvc: { claimName: "c" }, mountPath: "/x" },
+      ],
+    }),
+    /must specify exactly one backend \(host, pvc, ossfs, s3\)/
+  );
+});
+
 test("Sandbox.create rejects volume with no backend", async () => {
   const { adapterFactory } = createAdapterFactory();
 
@@ -364,7 +404,7 @@ test("Sandbox.create rejects volume with no backend", async () => {
       skipHealthCheck: true,
       volumes: [{ name: "empty", mountPath: "/mnt" }],
     }),
-    /must specify exactly one backend \(host, pvc, ossfs\)/
+    /must specify exactly one backend \(host, pvc, ossfs, s3\)/
   );
 });
 
@@ -391,7 +431,7 @@ test("Sandbox.create rejects volume with multiple backends", async () => {
         },
       ],
     }),
-    /must specify exactly one backend \(host, pvc, ossfs\)/
+    /must specify exactly one backend \(host, pvc, ossfs, s3\)/
   );
 });
 

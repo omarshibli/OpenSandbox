@@ -161,7 +161,7 @@ class AgentSandboxProvider(WorkloadProvider):
         )
 
         if volumes:
-            apply_volumes_to_pod_spec(pod_spec, volumes)
+            apply_volumes_to_pod_spec(pod_spec, volumes, sandbox_id=sandbox_id)
 
         self._apply_platform_node_selector(pod_spec, platform)
 

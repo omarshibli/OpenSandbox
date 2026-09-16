@@ -371,11 +371,29 @@ export interface OSSFS extends Record<string, unknown> {
 }
 
 /**
+ * Amazon S3 mount backend. Kubernetes runtime only.
+ *
+ * The server creates a static PersistentVolume for the Mountpoint for Amazon S3
+ * CSI driver and mounts it into the sandbox. Credentials come from the IAM role
+ * bound to the CSI driver ServiceAccount; the request carries none.
+ */
+export interface S3 extends Record<string, unknown> {
+  /** S3 bucket name. */
+  bucket: string;
+  /** Optional key prefix to mount, relative, no leading "/". */
+  prefix?: string;
+  /** Optional AWS region, e.g. "eu-west-1". */
+  region?: string;
+  /** Additional Mountpoint mount options without leading "-". */
+  options?: string[];
+}
+
+/**
  * Storage mount definition for a sandbox.
  *
  * Each volume entry contains:
  * - A unique name identifier
- * - Exactly one backend (host, pvc, ossfs) with backend-specific fields
+ * - Exactly one backend (host, pvc, ossfs, s3) with backend-specific fields
  * - Common mount settings (mountPath, readOnly, subPath)
  */
 export interface Volume extends Record<string, unknown> {
@@ -384,17 +402,21 @@ export interface Volume extends Record<string, unknown> {
    */
   name: string;
   /**
-   * Host path bind mount backend (mutually exclusive with pvc, ossfs).
+   * Host path bind mount backend (mutually exclusive with pvc, ossfs, s3).
    */
   host?: Host;
   /**
-   * Kubernetes PVC mount backend (mutually exclusive with host, ossfs).
+   * Kubernetes PVC mount backend (mutually exclusive with host, ossfs, s3).
    */
   pvc?: PVC;
   /**
-   * Alibaba Cloud OSSFS mount backend (mutually exclusive with host, pvc).
+   * Alibaba Cloud OSSFS mount backend (mutually exclusive with host, pvc, s3).
    */
   ossfs?: OSSFS;
+  /**
+   * Amazon S3 mount backend (mutually exclusive with host, pvc, ossfs). Kubernetes runtime only.
+   */
+  s3?: S3;
   /**
    * Absolute path inside the container where the volume is mounted.
    */
