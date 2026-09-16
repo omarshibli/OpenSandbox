@@ -233,7 +233,7 @@ End-to-end: the Kind e2e suite cannot run this (no AWS credentials, no `endpoint
 - `specs/sandbox-lifecycle.yml`: `S3` schema and `Volume.s3`.
 - Server: schema, validators, constants, config, Docker gate, `s3_volume.py`, `volume_helper.py` branch, cleanup and startup sweep, timeout detail.
 - SDKs: `S3` model and converters in Python, TypeScript, Go, C#, Kotlin.
-- `kubernetes/charts/opensandbox-server`: RBAC rules and a commented `[storage]` block in `configToml`.
+- `manifests/charts/server`: RBAC rules (`templates/rbac.yaml`) and a commented `[storage]` block in `configToml` (`values.yaml`).
 - `docs/examples/kubernetes-s3-volume-mount.md`, `docs/examples/index.md`, VitePress nav.
 - `server/configuration.md`: three new `[storage]` keys.
 - `docs/architecture/index.md`: list volume backends per runtime instead of the current blanket statement.

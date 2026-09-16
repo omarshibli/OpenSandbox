@@ -42,7 +42,7 @@
 | `server/opensandbox_server/services/k8s/batchsandbox_provider.py`, `agent_sandbox_provider.py` | Pass `sandbox_id` to the translator |
 | `server/opensandbox_server/services/k8s/kubernetes_service.py` | Wire provisioning, cleanup, timeout hint |
 | `server/opensandbox_server/main.py` | Startup orphan sweep |
-| `kubernetes/charts/opensandbox-server/templates/server.yaml`, `values.yaml` | RBAC and config comment |
+| `manifests/charts/server/templates/rbac.yaml`, `values.yaml` | RBAC and config comment |
 | SDK model files (5 languages) | `S3` model and `Volume.s3` |
 | `docs/examples/kubernetes-s3-volume-mount.md`, `docs/examples/index.md`, `docs/.vitepress/config.mts`, `docs/architecture/index.md`, `server/configuration.md` | Documentation |
 | `oseps/0024-s3-volume-backend.md` (number: next free) | Proposal record |
@@ -2099,8 +2099,8 @@ git commit -m "feat(k8s): wire s3 volume provisioning, cleanup and startup sweep
 ### Task 10: Helm RBAC and config comment
 
 **Files:**
-- Modify: `kubernetes/charts/opensandbox-server/templates/server.yaml:32-37`
-- Modify: `kubernetes/charts/opensandbox-server/values.yaml:150-175` (`configToml`)
+- Modify: `manifests/charts/server/templates/rbac.yaml`
+- Modify: `manifests/charts/server/values.yaml` (`configToml`)
 
 - [ ] **Step 1: Add RBAC rules**
 
@@ -2132,13 +2132,13 @@ In `values.yaml` `configToml`, after the `[kubernetes]` block and before `[egres
 
 - [ ] **Step 3: Render the chart**
 
-Run: `helm template test kubernetes/charts/opensandbox-server | grep -A2 -E 'persistentvolumes|csidrivers'`
+Run: `helm template test manifests/charts/server | grep -A2 -E 'persistentvolumes|csidrivers'`
 Expected: both rules appear. If `helm` is not installed, note it in the handoff.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add kubernetes/charts/opensandbox-server/templates/server.yaml kubernetes/charts/opensandbox-server/values.yaml
+git add manifests/charts/server/templates/rbac.yaml manifests/charts/server/values.yaml
 git commit -m "feat(helm): grant PV and CSIDriver RBAC for s3 volumes"
 ```
 

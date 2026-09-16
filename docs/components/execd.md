@@ -254,7 +254,7 @@ override it.
 | `EXECD_INIT` | Init-mode switch read by `bootstrap.sh`: when truthy (`1`/`true`/`yes`/`on`), the script `exec`s `execd --init -- <user command>` so execd becomes PID 1; see [Init mode](#init-mode). Unset preserves the classic background-and-wait topology. |
 | `EXECD_CLONE3_COMPAT` | Linux clone3 compatibility switch (see below). |
 | `EXECD_LOG_FILE` | Optional log output file path; default is stdout. |
-| `EXECD_ENVS` | Optional file of `KEY=VALUE` lines supplying command environment variables. Values expand daemon environment variables; blank lines and `#` comments are ignored. |
+| `EXECD_ENVS` | Optional file of `KEY=VALUE` lines supplying environment variables for commands and bash sessions. Values expand daemon environment variables; blank lines and `#` comments are ignored. Bash session `cwd` values also expand `$NAME` and `${NAME}` using the session environment. |
 | `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Preferred OTLP metrics endpoint. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Fallback OTLP endpoint when metrics-specific endpoint is unset. |
 | `OPENSANDBOX_ID` | Authoritative sandbox id stamped into eBPF audit records (`sandbox_id`) and metrics; the server injects it on Docker/Kubernetes task-template paths. Lifecycle Pool requests always schedule a task template and receive this value. Direct BatchSandbox resources that omit the task template cannot inject it, and the eBPF layer reports `unsupported` attribution on that path. |

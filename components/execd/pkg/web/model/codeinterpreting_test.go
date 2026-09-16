@@ -128,15 +128,12 @@ func unsetModelEnvForTest(t *testing.T, key string) {
 func ptr32(v uint32) *uint32 { return &v }
 
 func TestRunCommandRequestValidateUidGid(t *testing.T) {
-	// uid-only: valid
 	req := RunCommandRequest{Command: "id", Uid: ptr32(1000)}
 	require.NoError(t, req.Validate(), "expected success with uid only")
 
-	// uid + gid: valid
 	req = RunCommandRequest{Command: "id", Uid: ptr32(1000), Gid: ptr32(1000)}
 	require.NoError(t, req.Validate(), "expected success with uid and gid")
 
-	// gid-only: must be rejected
 	req = RunCommandRequest{Command: "id", Gid: ptr32(1000)}
 	require.Error(t, req.Validate(), "expected validation error when gid is set without uid")
 }
@@ -224,8 +221,10 @@ func TestCommandAndSessionCwdUseTheirOwnEnvironment(t *testing.T) {
 		req.Envs = map[string]string{"ARGV_DIR": missing}
 		require.Error(t, req.Validate())
 	}
+	// Session cwd validation is deferred to the runtime layer, which resolves
+	// against the target session's environment (EXECD_ENVS file values and
+	// variables exported in earlier runs), not the daemon environment. See
+	// Controller.ValidateBashSessionCwd.
 	session := RunInSessionRequest{Command: "pwd", Cwd: "$ARGV_DIR"}
-	require.Error(t, session.Validate())
-	t.Setenv("ARGV_DIR", dir)
 	require.NoError(t, session.Validate())
 }
