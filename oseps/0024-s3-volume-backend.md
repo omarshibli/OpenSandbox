@@ -1,10 +1,10 @@
 ---
 title: S3 Volume Backend
 authors:
-  - "Omar Shibli"
+  - "@omarshibli"
 creation-date: 2026-09-15
-last-updated: 2026-09-16
-status: provisional
+last-updated: 2026-09-17
+status: draft
 ---
 
 # OSEP-0024: S3 Volume Backend
@@ -32,7 +32,7 @@ Add an `s3` backend to `volumes[]` in the Lifecycle API that mounts an object-st
 
 The backend is named after the storage API, not the tool or the cloud. S3-compatible stores such as Alibaba Cloud OSS (through its S3-compatible endpoint) and MinIO can be reached later by adding an optional `endpoint` field, without changing the shape of the API.
 
-The Docker and FastSandbox runtimes reject `s3` in this phase.
+This phase supports Linux sandboxes and general-purpose S3 buckets only. Docker and FastSandbox reject `s3`. All callers must share the same S3 access. The server rejects S3 requests when `[tenants]` is configured.
 
 This OSEP extends OSEP-0003 (Volume Support), which named `s3` as a future backend. A reference implementation exists and is proposed as follow-up PRs (server and Helm, then SDKs, then docs) once the design direction here is agreed.
 
@@ -52,7 +52,7 @@ The existing object-storage backend, `ossfs`, is Docker-only and requires inline
 
 - Docker runtime support. A later phase can add `mount-s3` on the host with the EC2 instance profile.
 - S3-compatible stores such as MinIO. A later `endpoint` field can add this.
-- Per-tenant IAM roles. A later `authenticationSource: pod` extension can add this without an API change.
+- Tenant-specific S3 access. If needed, a later design can add prefix authorization or IAM roles per tenant, for example through `authenticationSource: pod`.
 - Full POSIX semantics. Mountpoint semantics are documented and accepted.
 - Changes to the fast-sandbox template publish path or to snapshots.
 
@@ -64,7 +64,7 @@ The existing object-storage backend, `ossfs`, is Docker-only and requires inline
 - The sandbox pod stays unprivileged: no `/dev/fuse`, no `SYS_ADMIN`, no ServiceAccount change. The kubelet performs the mount on the node, so gVisor and Kata receive it as a host directory.
 - Every object the server creates is labeled and removable, including after a server restart.
 - Operators can constrain the feature through config: the CSIDriver name, default mount options, and an optional bucket allowlist.
-- Unsupported runtimes and missing cluster prerequisites fail with a named error, not a timeout.
+- Unsupported runtimes, Windows requests, and tenant mode fail before resource creation. A missing driver registration fails early on an uncached check. The positive driver cache does not detect later removal; operators must restart all server processes after removing or disabling the add-on.
 
 ## Proposal
 
@@ -75,7 +75,7 @@ volumes:
   - name: logs
     s3:
       bucket: "my-team-sandbox-logs"     # required
-      prefix: "sandboxes/task-001/"      # optional; the server adds a trailing "/" if absent
+      prefix: "sandboxes/task-001/"      # optional; non-empty values must end with "/"
       region: "eu-west-1"                # optional; Mountpoint detects it if absent
       options: ["uid=1000", "gid=1000"]  # optional; supported ownership and permission options
     mountPath: /mnt/logs
@@ -84,10 +84,12 @@ volumes:
 
 | Field | Type | Required | Rules |
 |---|---|---|---|
-| `bucket` | string | yes | S3 bucket naming rules: 3 to 63 chars, lowercase letters, digits, dots, hyphens; starts and ends with a letter or digit. If `storage.s3_allowed_buckets` is non-empty, the bucket must be in it. |
-| `prefix` | string | no | No leading `/`, no `..` segment, no shell metacharacters, max 1024 bytes. Normalized to end with `/`. |
-| `region` | string | no | Matches `^[a-z]{2}(-[a-z]+)+-\d$`. |
+| `bucket` | string | yes | General-purpose S3 bucket naming rules below: 3 to 63 chars, lowercase letters, digits, dots, hyphens; starts and ends with a letter or digit. If `storage.s3_allowed_buckets` is non-empty, the bucket must be in it. |
+| `prefix` | string | no | Omitted or empty means bucket root; emit no `prefix` option. Non-empty values must end with `/`, have no leading `/`, no `..` segment, no shell metacharacters, and be at most 1024 bytes. Pass accepted values unchanged. |
+| `region` | string | no | Lowercase token matching `^[a-z0-9]+(?:-[a-z0-9]+)*$`. Check format only, pass unchanged, and let AWS determine whether the region exists. |
 | `options` | []string | no | Only `uid`, `gid`, `file-mode`, and `dir-mode`. Accept `name=value` or `name value`. Reject unknown names, missing values, leading `-`, and shell metacharacters. |
+
+Bucket validation follows the [AWS general-purpose bucket naming rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucketnamingrules.html). Reject adjacent periods, IP-address-form names, reserved prefixes (`xn--`, `sthree-`, `amzn-s3-demo-`), and reserved suffixes (`-s3alias`, `--ol-s3`, `.mrap`, `--x-s3`, `--table-s3`). Names ending in `-an` must follow the AWS account regional namespace format. Return `VOLUME::INVALID_S3_BUCKET` before resource creation. Directory buckets and access point aliases are outside this phase.
 
 Design decisions behind that shape:
 
@@ -115,11 +117,11 @@ The recommended log pattern is therefore **one object per command**, for example
 
 ### Risks and Mitigations
 
-- **A single IAM role is shared by all sandboxes in the cluster.** Mitigation: the role's resource ARNs are the real boundary, and the optional `s3_allowed_buckets` allowlist adds a server-side check. Per-tenant roles remain possible later through `authenticationSource: pod` with no API change.
-- **Users expect POSIX behavior and see silent surprises** (no append, no rename). Mitigation: the semantics table above ships in `docs/examples/kubernetes-s3-volume-mount.md` with the one-object-per-command pattern.
+- **A single IAM role is shared by all sandboxes in the cluster.** The IAM policy and bucket allowlist do not separate callers within a bucket. All callers must share the same S3 access. Reject S3 requests when `[tenants]` is configured. A request prefix selects data; it does not authorize access. Tenant-specific access is a possible future enhancement if required.
+- **Users expect POSIX behavior and see silent surprises** (no append, no rename). Mitigation: the semantics table above will be included in the planned documentation page `docs/examples/kubernetes-s3-volume-mount.md` with the one-object-per-command pattern.
 - **Leaked cluster-scoped PVs.** PVs cannot carry a namespaced `ownerReference`, so garbage collection does not reclaim them. Mitigation: labeled objects, deletion on the sandbox delete and create-failure paths, and a gated orphan sweep (at startup and on a timer) that removes PVs after both their workload and `claimRef` PVC are gone. This also reclaims PVs after controller-driven TTL expiry.
 - **Mount failures surface only as a pod that never becomes ready.** Mitigation: on a readiness timeout for a sandbox with an `s3` volume, the server appends the last `FailedMount` event to the error detail.
-- **Cluster prerequisites missing.** Mitigation: the server checks for the `CSIDriver` object and fails with `VOLUME::UNSUPPORTED_BACKEND` and a message naming the add-on to install.
+- **Cluster prerequisites missing.** The server checks for the `CSIDriver` object until a positive result is cached. This checks registration, not driver health. After driver removal or disablement, requests can time out until all server processes restart.
 - **Unsafe mount options.** Mitigation: only the four ownership and permission options above are accepted. Validate names and values for both request and operator options; validate operator options at startup.
 
 ## Design Details
@@ -141,8 +143,8 @@ All new S3 logic lives in one new module, `server/opensandbox_server/services/k8
 
 1. **Parse.** `api/schema.py`: `S3` Pydantic model, `Volume.s3`, exactly-one-backend validator extended.
 2. **Validate.** `services/validators.py`: `ensure_valid_s3_volume`, called from `ensure_volumes_valid`, which also rejects `subPath` for `s3`. Error codes in `services/constants.py`.
-3. **Runtime gate.** `services/docker/volumes.py` raises `VOLUME::UNSUPPORTED_BACKEND` for `s3`. FastSandbox already rejects all volumes.
-4. **Driver check.** On the first `s3` request, the server reads `storage.k8s.io/v1 CSIDriver <s3_csi_driver>`. A positive result is cached for the process lifetime. If missing, the request fails with `VOLUME::UNSUPPORTED_BACKEND` and a message that names the add-on to install.
+3. **Runtime and deployment gates.** `services/docker/volumes.py` raises `VOLUME::UNSUPPORTED_BACKEND` for `s3`. FastSandbox already rejects all volumes. Before creating Kubernetes objects, reject S3 requests with `platform.os=windows` or with `[tenants]` configured, using `VOLUME::UNSUPPORTED_BACKEND` and a message naming the limitation. Do not change the requested operating system.
+4. **Driver check.** On the first `s3` request, the server reads `storage.k8s.io/v1 CSIDriver <s3_csi_driver>`. A positive result is cached for the process lifetime to avoid an API read on every S3 request. Operators must restart all server processes after removing or disabling the add-on; otherwise later requests can time out. If missing on an uncached check, the request fails with `VOLUME::UNSUPPORTED_BACKEND` and a message that names the add-on to install.
 5. **Pod spec.** Compute the S3 claim names before workload creation. `services/k8s/volume_helper.py` emits a `persistentVolumeClaim` source and a mount with `mountPath` and `readOnly`. No `subPath`.
 6. **Workload.** Keep `_ensure_pvc_volumes` in its current position for existing PVC backends. Create the workload CR before provisioning S3 volumes. Its pod references the computed claim names and waits until those claims exist and are bound. Do not start the readiness wait yet.
 7. **Provision and ownership.** For each `s3` volume, create one PV and one PVC. Include the workload CR's `ownerReference` in the initial PVC create request. There is no later owner patch for S3 claims. Then start the readiness wait. If provisioning fails, use the existing workload rollback path before volume cleanup. If workload deletion fails, keep its volumes for a later delete attempt. PVs are cluster-scoped and cannot have a namespaced owner; they need explicit cleanup.
@@ -230,15 +232,17 @@ The server Helm chart ClusterRole adds:
 
 ### Identity (operator setup)
 
-Documented in `docs/examples/kubernetes-s3-volume-mount.md`.
+Will be documented in `docs/examples/kubernetes-s3-volume-mount.md`, a planned deliverable of the follow-up documentation PR.
 
 1. Install the Mountpoint for Amazon S3 CSI driver EKS add-on (`aws-mountpoint-s3-csi-driver`). It runs in `kube-system` with ServiceAccount `s3-csi-driver-sa`.
 2. Create one IAM role with `s3:ListBucket` on the bucket ARNs and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:AbortMultipartUpload` on the object ARNs. Limit resources to the buckets sandboxes may reach.
 3. Bind the role to that ServiceAccount with an EKS Pod Identity association (recommended) or an IRSA `eks.amazonaws.com/role-arn` annotation.
 
+The listed permissions match the [Mountpoint general-purpose bucket policy example](https://github.com/awslabs/mountpoint-s3/blob/main/doc/CONFIGURATION.md#iam-permissions). Verify them on EKS with the CSI driver and Mountpoint versions selected for implementation. Add permissions only if those versions or selected storage features require them.
+
 The sandbox pod needs no ServiceAccount change, no capabilities, and no FUSE device. The kubelet performs the mount on the node. gVisor and Kata receive the mount as a host directory.
 
-Future extension, no API change: `volumeAttributes.authenticationSource: pod` plus an annotated sandbox ServiceAccount gives one role per tenant.
+If tenant-specific access is needed later, evaluate `volumeAttributes.authenticationSource: pod` with tenant-specific ServiceAccounts and IAM policies. This phase does not support tenant mode.
 
 ### Errors
 
@@ -248,11 +252,11 @@ Validation, HTTP 400, before any side effect:
 |---|---|
 | `VOLUME::INVALID_BACKEND` | Zero or more than one backend (existing) |
 | `VOLUME::INVALID_S3_BUCKET` | Name breaks S3 rules, or not in `s3_allowed_buckets` |
-| `VOLUME::INVALID_S3_PREFIX` | Leading `/`, `..` segment, shell metacharacters, or over 1024 bytes |
+| `VOLUME::INVALID_S3_PREFIX` | Non-empty prefix without a trailing `/`, leading `/`, `..` segment, shell metacharacters, or over 1024 bytes |
 | `VOLUME::INVALID_S3_REGION` | Does not match the region pattern |
 | `VOLUME::INVALID_S3_OPTION` | Unsupported option name, missing or invalid value, leading `-`, or shell metacharacters |
 | `VOLUME::INVALID_SUB_PATH` | `subPath` given on an `s3` volume; message points to `s3.prefix` |
-| `VOLUME::UNSUPPORTED_BACKEND` | Docker or FastSandbox runtime, or the `CSIDriver` object is missing |
+| `VOLUME::UNSUPPORTED_BACKEND` | Docker or FastSandbox runtime, Windows request, tenant mode, or missing `CSIDriver` on an uncached check |
 
 Provisioning, from the Kubernetes API:
 
@@ -267,18 +271,18 @@ Cleanup is best effort and logged; 404 is success, and the orphan sweep (startup
 Unit tests in `server/tests/`, following the `ossfs` and PVC test shapes, ship with the implementation PRs:
 
 - **Schema** (`test_schema.py`): valid `s3` volume, serialization round trip, `s3` plus another backend rejected, unknown field rejected.
-- **Validators** (`test_validators.py`): one test per error code; bucket allowlist; option allowlist and value bounds; reject `endpoint-url`, `no-sign-request`, `profile`, and server-owned options; accept both option forms; `subPath` rejection; prefix normalization. Apply the same option tests to operator defaults.
-- **Pod spec** (`test_batchsandbox_provider.py`): PVC source and mount for `s3`, with and without `readOnly`, no `subPath`; multiple `s3` volumes; internal name conflict.
-- **Provisioning** (new `test_s3_volume.py`): PV and PVC bodies match this design exactly, including read-only handling and one entry per option name; request `uid 2000` replaces operator `uid=1000`; repeated names within one list use the last value; rollback on partial failure; 409 reuse and mismatch; missing `CSIDriver`; cleanup deletes PV and PVC; workload creation precedes S3 provisioning; every PVC create includes the workload owner UID; timeout detail includes the `FailedMount` message.
+- **Validators** (`test_validators.py`): one test per error code; bucket allowlist; reject adjacent periods, IP-address-form bucket names, reserved prefixes and suffixes, and invalid account regional namespace names; option allowlist and value bounds; reject `endpoint-url`, `no-sign-request`, `profile`, and server-owned options; accept both option forms; `subPath` rejection; omitted and empty prefixes emit no prefix option; non-empty prefixes require a trailing `/` and pass unchanged; invalid prefixes fail before resource creation; accept `eu-west-1` and `eusc-de-east-1`; reject empty or malformed region tokens. Apply the same option tests to operator defaults.
+- **Pod spec** (BatchSandbox and agent-sandbox provider tests): PVC source and mount for `s3`, with and without `readOnly`, no `subPath`; multiple `s3` volumes; internal name conflict.
+- **Provisioning** (new `test_s3_volume.py`): PV and PVC bodies match this design exactly, including read-only handling and one entry per option name; request `uid 2000` replaces operator `uid=1000`; repeated names within one list use the last value; rollback on partial failure; 409 reuse and mismatch; missing `CSIDriver` before a positive check; positive cache reused until restart; a fresh process detects driver removal; cleanup deletes PV and PVC; workload creation precedes S3 provisioning; every PVC create includes the workload owner UID; timeout detail includes the `FailedMount` message.
 - **Crash recovery**: stop after PV creation and after PVC creation, then restart the server and delete or expire the workload. Verify that no PV or PVC remains. Keep PVs for live workloads, including slow creation requests with no PVC yet. Keep bound or fresh PVs, and skip cleanup on lookup errors. Reclaim aged or Released PVs only after both workload and PVC are gone. Verify UID preconditions protect replacement PVs.
-- **Runtime gate** (`test_docker_service.py`): `s3` returns `UNSUPPORTED_BACKEND`.
+- **Runtime and deployment gates**: Docker returns `UNSUPPORTED_BACKEND` for `s3`; FastSandbox keeps its volume rejection. Kubernetes rejects Windows S3 requests and S3 requests with `[tenants]` configured before resource creation. Linux requests without tenant mode remain supported.
 - **SDKs**: model tests per SDK, like the `OSSFS` tests.
 
-The Kind e2e suite **cannot** cover this backend: it has no AWS credentials, and without an `endpoint` field it cannot be pointed at MinIO. Verification is therefore manual on EKS, and the procedure is recorded in the docs page:
+The Kind e2e suite **cannot** cover this backend: it has no AWS credentials, and without an `endpoint` field it cannot be pointed at MinIO. Verification is therefore manual on EKS. The planned docs page will record the procedure and the verified CSI driver and Mountpoint versions:
 
-1. Install the add-on and create the IAM role and Pod Identity association.
+1. Install the selected add-on version and create the IAM role with only the listed S3 permissions and the Pod Identity association.
 2. Create a sandbox with an `s3` volume.
-3. Run a command that writes a file under the mount; confirm the object in the bucket.
+3. With `region` omitted, verify mounting, listing, reading, writing, overwriting, deleting, and aborting a multipart upload. Confirm the resulting objects in S3. Record any additional permissions required by the selected versions or storage features.
 4. Delete the sandbox; confirm the PV and PVC are gone.
 
 ## Drawbacks
@@ -286,7 +290,7 @@ The Kind e2e suite **cannot** cover this backend: it has no AWS credentials, and
 - The server now creates cluster-scoped objects (PVs), which needs wider RBAC and its own cleanup path, including a periodic orphan sweep, because Kubernetes garbage collection cannot own them.
 - The first realization is cloud-specific. It works on EKS with an AWS add-on, so the Kubernetes runtime gains a backend that not every Kubernetes deployment can use until the `endpoint` follow-up lands, and an operator prerequisite that the server can only detect, not install.
 - Mountpoint semantics are weaker than POSIX. Applications that append or edit in place break inside the mount, which the API cannot express.
-- Sandboxes share one IAM role until per-tenant identity lands, so the blast radius of a bucket grant is the whole cluster.
+- Sandboxes share one IAM role, so a bucket grant applies to all callers. S3 volumes are unavailable in tenant mode. Tenant-specific access remains a possible future enhancement.
 - One PV and one PVC per volume per sandbox adds API objects proportional to sandbox churn.
 
 ## Alternatives
@@ -305,4 +309,4 @@ The Kind e2e suite **cannot** cover this backend: it has no AWS credentials, and
 
 The change is additive and there is nothing to migrate. Existing volume backends, requests, and stored sandboxes are unaffected, and a client that never sends `s3` sees no behavior change.
 
-Operators who want the backend install the CSI add-on and the IAM role, then upgrade the Helm chart to pick up the new RBAC rules; the optional `[storage]` keys default to the values above. A server without the CSI add-on stays fully functional and rejects `s3` requests with `VOLUME::UNSUPPORTED_BACKEND`. Downgrading is safe once no `s3` sandboxes are live; leftover PVs and PVCs carry the `opensandbox.io/volume-managed-by=server` label and can be deleted with a label selector.
+Operators who want the backend install the CSI add-on and the IAM role, then upgrade the Helm chart to pick up the new RBAC rules; the optional `[storage]` keys default to the values above. A server without a cached positive driver check rejects `s3` requests with `VOLUME::UNSUPPORTED_BACKEND` when the add-on is absent. Operators must restart all server processes after removing or disabling the add-on to clear the cache. Existing volume backends remain available. Downgrading is safe once no `s3` sandboxes are live; leftover PVs and PVCs carry the `opensandbox.io/volume-managed-by=server` label and can be deleted with a label selector.
